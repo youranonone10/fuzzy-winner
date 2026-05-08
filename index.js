@@ -1,41 +1,15 @@
-const cron   = require("node-cron");
-const axios  = require("axios");
-const twilio = require("twilio");
+const cron  = require("node-cron");
+const axios = require("axios");
 
-// ─── CONFIG ────────────────────────────────────────────────────────────────────
-const DOMAIN    = process.env.FRESHDESK_DOMAIN;
-const API_KEY   = process.env.FRESHDESK_API_KEY;
-const AGENT_IDS = process.env.AGENT_IDS.split(",").map(Number);
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const DOMAIN      = process.env.FRESHDESK_DOMAIN;
+const API_KEY     = process.env.FRESHDESK_API_KEY;
+const AGENT_IDS   = process.env.AGENT_IDS.split(",").map(Number);
 const AGENT_NAMES = process.env.AGENT_NAMES.split(",").map(s => s.trim());
 
-const TWILIO_SID   = process.env.TWILIO_SID;
-const TWILIO_TOKEN = process.env.TWILIO_TOKEN;
-const TWILIO_FROM  = process.env.TWILIO_WHATSAPP_FROM;
-const YOUR_NUMBER  = process.env.YOUR_WHATSAPP_NUMBER;
-
-const MANAGER_NUMBERS = process.env.MANAGER_WHATSAPP_NUMBERS
-  ? process.env.MANAGER_WHATSAPP_NUMBERS.split(",").map(s => s.trim())
-  : [];
-
 const auth = { username: API_KEY, password: "X" };
-const twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
-
-// ─── WHATSAPP ──────────────────────────────────────────────────────────────────
-async function sendWhatsApp(to, message) {
-  try {
-    await twilioClient.messages.create({ from: TWILIO_FROM, to, body: message });
-    console.log("📱 WhatsApp sent to " + to);
-  } catch (err) {
-    console.error("WhatsApp failed:", err.message);
-  }
-}
-
-async function broadcastWhatsApp(numbers, message) {
-  for (const num of numbers) await sendWhatsApp(num, message);
-}
 
 // ─── GET ALL OPEN + UNASSIGNED TICKETS ────────────────────────────────────────
-// STATUS 2 = Open. Bot ONLY assigns. NEVER closes or resolves anything.
 async function getAllOpenUnassigned() {
   let page = 1, all = [];
   while (true) {
@@ -53,8 +27,8 @@ async function getAllOpenUnassigned() {
   return all;
 }
 
-// ─── ASSIGN ONE TICKET ────────────────────────────────────────────────────────
-// Only sets responder_id. Does NOT touch status or anything else.
+// ─── ASSIGN ONE TICKET TO ONE AGENT ──────────────────────────────────────────
+// Only sets responder_id. Never changes status or anything else.
 async function assignTicket(ticketId, agentId) {
   try {
     await axios.put(
@@ -65,12 +39,12 @@ async function assignTicket(ticketId, agentId) {
     return true;
   } catch (err) {
     const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-    console.error("❌ Failed ticket #" + ticketId + " → agent " + agentId + ": " + detail);
+    console.error("❌ Failed ticket #" + ticketId + ": " + detail);
     return false;
   }
 }
 
-// ─── MAIN: ASSIGN ALL OPEN UNASSIGNED TICKETS EQUALLY ─────────────────────────
+// ─── MAIN: EQUAL ROUND-ROBIN ASSIGNMENT ───────────────────────────────────────
 async function runAssignment(triggeredBy) {
   triggeredBy = triggeredBy || "schedule";
   console.log("\n🌅 ===== AUTO-ASSIGN STARTED (" + triggeredBy + ") =====");
@@ -79,13 +53,10 @@ async function runAssignment(triggeredBy) {
   const tickets = await getAllOpenUnassigned();
 
   if (tickets.length === 0) {
-    await sendWhatsApp(YOUR_NUMBER,
-      "✅ *Auto-assign ran (" + triggeredBy + ")*\n\nNo open unassigned tickets found. All clear!\n\n_" + now() + "_"
-    );
+    console.log("✅ No unassigned tickets found. Nothing to do!");
     return;
   }
 
-  // Pure equal round-robin — ticket 0→agent 0, ticket 1→agent 1, wraps around
   let assigned = 0, failed = 0;
   const perAgent = {};
   AGENT_IDS.forEach((id, i) => {
@@ -94,7 +65,7 @@ async function runAssignment(triggeredBy) {
 
   for (let i = 0; i < tickets.length; i++) {
     const ticket  = tickets[i];
-    const agentId = AGENT_IDS[i % AGENT_IDS.length];
+    const agentId = AGENT_IDS[i % AGENT_IDS.length]; // equal round-robin
     const ok = await assignTicket(ticket.id, agentId);
     if (ok) {
       perAgent[agentId].count++;
@@ -106,25 +77,14 @@ async function runAssignment(triggeredBy) {
   }
 
   const duration = Math.round((Date.now() - startTime) / 1000);
-  const agentLines = Object.values(perAgent)
-    .map(a => "  • " + a.name + ": *" + a.count + " tickets*")
-    .join("\n");
-
-  const msg =
-    "🌅 *Ticket Assignment Complete*\n\n" +
-    "📊 *Summary*\n" +
-    "✅ Assigned: *" + assigned + "* tickets\n" +
-    "❌ Failed: *" + failed + "*\n" +
-    "⏱️ Time: " + duration + "s\n\n" +
-    "👥 *Per Agent (equal split)*\n" + agentLines + "\n\n" +
-    "_" + now() + "_";
-
-  await sendWhatsApp(YOUR_NUMBER, msg);
-  if (MANAGER_NUMBERS.length) await broadcastWhatsApp(MANAGER_NUMBERS, msg);
-  console.log("✅ Done! " + assigned + " assigned, " + failed + " failed in " + duration + "s");
+  console.log("\n📊 DONE! Assigned: " + assigned + " | Failed: " + failed + " | Time: " + duration + "s");
+  console.log("👥 Per agent breakdown:");
+  Object.values(perAgent).forEach(a => {
+    console.log("   • " + a.name + ": " + a.count + " tickets");
+  });
 }
 
-// ─── SURGE: auto-assign if 20+ new tickets pile up ────────────────────────────
+// ─── SURGE CHECK: auto-assign if 20+ new tickets pile up ─────────────────────
 let lastCount = 0;
 async function checkSurge() {
   const tickets = await getAllOpenUnassigned();
@@ -132,41 +92,20 @@ async function checkSurge() {
   if (tickets.length > 0 && spike >= 20) {
     console.log("🚨 Surge! " + spike + " new tickets — auto-assigning now");
     await runAssignment("surge-auto");
+  } else {
+    console.log("📈 Surge check: " + tickets.length + " unassigned (+" + Math.max(0,spike) + " new)");
   }
   lastCount = tickets.length;
 }
 
-// ─── END OF DAY REPORT ────────────────────────────────────────────────────────
-async function endOfDayReport() {
-  const res = await axios.get(
-    "https://" + DOMAIN + "/api/v2/tickets?filter=new_and_my_open&per_page=100",
-    { auth }
-  );
-  const open       = res.data.filter(t => t.status === 2);
-  const unassigned = open.filter(t => !t.responder_id);
-  const msg =
-    "📊 *End of Day Report*\n\n" +
-    "📬 Open tickets: *" + open.length + "*\n" +
-    "🔴 Still unassigned: *" + unassigned.length + "*\n\n" +
-    (unassigned.length > 0 ? "⚠️ Some tickets still need assignment tomorrow!\n\n" : "✅ All tickets assigned!\n\n") +
-    "_" + now() + "_";
-  await sendWhatsApp(YOUR_NUMBER, msg);
-  if (MANAGER_NUMBERS.length) await broadcastWhatsApp(MANAGER_NUMBERS, msg);
-}
-
-function now() {
-  return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-}
-
-// ─── SCHEDULE ─────────────────────────────────────────────────────────────────
-// 9:30 AM IST daily (Mon-Sat)
+// ─── SCHEDULE (IST) ───────────────────────────────────────────────────────────
+// 9:30 AM IST = 4:00 AM UTC — runs Mon to Sat
 cron.schedule("0 4 * * 1-6",       () => runAssignment("9:30am"), { timezone: "Asia/Kolkata" });
-// Every 30 min during work hours — surge check
+// Surge check every 30 min during work hours
 cron.schedule("*/30 3-14 * * 1-6", checkSurge,                    { timezone: "Asia/Kolkata" });
-// 6:30 PM end of day report
-cron.schedule("30 13 * * 1-6",     endOfDayReport,                { timezone: "Asia/Kolkata" });
 
-console.log("🚀 Bot running!");
-console.log("✅ Assigns open+unassigned tickets equally to all " + AGENT_IDS.length + " agents");
-console.log("❌ NEVER closes or resolves any ticket");
+console.log("🚀 Freshdesk Auto-Assign Bot is running!");
+console.log("📋 Assigns open+unassigned tickets equally to " + AGENT_IDS.length + " agents");
+console.log("⏰ Runs at 9:30 AM IST every weekday + surge check every 30 min");
+console.log("❌ Never closes or resolves any ticket");
 console.log("👥 Agents: " + AGENT_NAMES.join(", "));
