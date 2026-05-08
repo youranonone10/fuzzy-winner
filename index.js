@@ -3,7 +3,6 @@ const axios = require("axios");
 const http  = require("http");
 const url   = require("url");
 
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
 const DOMAIN      = process.env.FRESHDESK_DOMAIN;
 const API_KEY     = process.env.FRESHDESK_API_KEY;
 const AGENT_IDS   = process.env.AGENT_IDS.split(",").map(Number);
@@ -11,44 +10,67 @@ const AGENT_NAMES = process.env.AGENT_NAMES.split(",").map(s => s.trim());
 const PORT        = process.env.PORT || 3000;
 const auth        = { username: API_KEY, password: "X" };
 
-// ─── FRESHDESK API ────────────────────────────────────────────────────────────
-async function getAllOpenUnassigned() {
+// ─── FRESHDESK HELPERS ────────────────────────────────────────────────────────
+async function fetchAllPages(filter) {
   let page = 1, all = [];
   while (true) {
     const res = await axios.get(
-      "https://" + DOMAIN + "/api/v2/tickets?filter=new_and_my_open&per_page=100&page=" + page,
+      "https://" + DOMAIN + "/api/v2/tickets?filter=" + filter + "&per_page=100&page=" + page,
       { auth }
     );
-    const batch = res.data;
-    const unassigned = batch.filter(t => t.status === 2 && !t.responder_id);
-    all = all.concat(unassigned);
-    if (batch.length < 100) break;
+    all = all.concat(res.data);
+    if (res.data.length < 100) break;
     page++;
+    if (page > 10) break; // safety
   }
   return all;
 }
 
-async function getAllOpenTickets() {
-  let page = 1, all = [];
-  while (true) {
-    const res = await axios.get(
-      "https://" + DOMAIN + "/api/v2/tickets?filter=new_and_my_open&per_page=100&page=" + page,
-      { auth }
-    );
-    const batch = res.data;
-    all = all.concat(batch.filter(t => t.status === 2));
-    if (batch.length < 100) break;
-    page++;
-  }
-  return all;
+// status 2=open, 3=pending, 4=resolved, 5=closed
+async function getStats() {
+  const all = await fetchAllPages("new_and_my_open");
+  const open       = all.filter(t => t.status === 2);
+  const pending    = all.filter(t => t.status === 3);
+  const unassigned = open.filter(t => !t.responder_id);
+  const assigned   = open.filter(t => !!t.responder_id);
+  const overdue    = all.filter(t => t.due_by && new Date(t.due_by) < new Date() && t.status < 4);
+
+  // unresolved = open + pending (not resolved/closed)
+  const unresolved = all.filter(t => t.status < 4);
+
+  return {
+    open: open.length,
+    unassigned: unassigned.length,
+    assigned: assigned.length,
+    pending: pending.length,
+    overdue: overdue.length,
+    unresolved: unresolved.length,
+    unresolvedTickets: unresolved.slice(0, 100).map(t => ({
+      id: t.id,
+      subject: t.subject || "No subject",
+      status: t.status,
+      priority: t.priority,
+      responder_id: t.responder_id,
+      due_by: t.due_by,
+      created_at: t.created_at
+    })),
+    unassignedTickets: unassigned.slice(0, 100).map(t => ({
+      id: t.id, subject: t.subject || "No subject", priority: t.priority, created_at: t.created_at
+    }))
+  };
 }
 
-async function getAgentTickets(agentId) {
-  const res = await axios.get(
-    "https://" + DOMAIN + "/api/v2/tickets?filter=new_and_my_open&per_page=100",
-    { auth }
-  );
-  return res.data.filter(t => t.status === 2 && t.responder_id === agentId);
+// Fix: use agent-specific filter to get correct per-agent counts
+async function getAgentCounts() {
+  const all = await fetchAllPages("new_and_my_open");
+  const open = all.filter(t => t.status === 2);
+  const result = AGENT_IDS.map((id, i) => ({
+    id,
+    name: AGENT_NAMES[i] || "Agent "+(i+1),
+    count: open.filter(t => t.responder_id === id).length,
+    unresolved: all.filter(t => t.responder_id === id && t.status < 4).length
+  }));
+  return result;
 }
 
 async function assignTicket(ticketId, agentId) {
@@ -60,234 +82,285 @@ async function assignTicket(ticketId, agentId) {
     );
     return true;
   } catch (err) {
-    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-    console.error("Failed ticket #" + ticketId + ": " + detail);
+    console.error("Failed #" + ticketId + ": " + (err.response?.data ? JSON.stringify(err.response.data) : err.message));
     return false;
   }
 }
 
-async function runAssignment(agentIdList) {
+// Assign unassigned tickets first, then unresolved — equally to selected agents
+async function runFullAssignment(agentIdList) {
   agentIdList = agentIdList || AGENT_IDS;
-  const tickets = await getAllOpenUnassigned();
-  if (tickets.length === 0) return { assigned: 0, failed: 0, perAgent: {}, tickets: [] };
+  const all = await fetchAllPages("new_and_my_open");
+
+  // Step 1: unassigned open tickets
+  const unassigned = all.filter(t => t.status === 2 && !t.responder_id);
+  // Step 2: unresolved tickets (open+pending) that ARE assigned — for redistribution
+  const unresolved = all.filter(t => t.status < 4 && !!t.responder_id);
+
+  const toAssign = [...unassigned, ...unresolved];
+  if (toAssign.length === 0) return { assigned: 0, failed: 0, tickets: [] };
+
   let assigned = 0, failed = 0;
   const perAgent = {};
   agentIdList.forEach((id, i) => {
     const idx = AGENT_IDS.indexOf(id);
-    perAgent[id] = { name: AGENT_NAMES[idx] || ("Agent " + (i+1)), count: 0 };
+    perAgent[id] = { name: AGENT_NAMES[idx] || "Agent "+(i+1), count: 0 };
   });
   const results = [];
-  for (let i = 0; i < tickets.length; i++) {
-    const ticket  = tickets[i];
+
+  for (let i = 0; i < toAssign.length; i++) {
+    const ticket  = toAssign[i];
     const agentId = agentIdList[i % agentIdList.length];
     const ok = await assignTicket(ticket.id, agentId);
     if (ok) { perAgent[agentId].count++; assigned++; }
     else failed++;
-    results.push({ id: ticket.id, subject: ticket.subject, agent: perAgent[agentId]?.name, ok });
+    results.push({
+      id: ticket.id,
+      subject: ticket.subject || "No subject",
+      agent: perAgent[agentId]?.name,
+      type: !ticket.responder_id ? "unassigned" : "unresolved",
+      ok
+    });
+  }
+  return { assigned, failed, perAgent, tickets: results };
+}
+
+// Assign only unassigned tickets to selected agents
+async function runUnassignedOnly(agentIdList) {
+  agentIdList = agentIdList || AGENT_IDS;
+  const all = await fetchAllPages("new_and_my_open");
+  const unassigned = all.filter(t => t.status === 2 && !t.responder_id);
+  if (unassigned.length === 0) return { assigned: 0, failed: 0, tickets: [] };
+
+  let assigned = 0, failed = 0;
+  const perAgent = {};
+  agentIdList.forEach((id, i) => {
+    const idx = AGENT_IDS.indexOf(id);
+    perAgent[id] = { name: AGENT_NAMES[idx] || "Agent "+(i+1), count: 0 };
+  });
+  const results = [];
+  for (let i = 0; i < unassigned.length; i++) {
+    const ticket  = unassigned[i];
+    const agentId = agentIdList[i % agentIdList.length];
+    const ok = await assignTicket(ticket.id, agentId);
+    if (ok) { perAgent[agentId].count++; assigned++; }
+    else failed++;
+    results.push({ id: ticket.id, subject: ticket.subject || "No subject", agent: perAgent[agentId]?.name, type: "unassigned", ok });
   }
   return { assigned, failed, perAgent, tickets: results };
 }
 
 async function reshuffleAgent(agentId) {
-  const tickets = await getAgentTickets(agentId);
+  const all = await fetchAllPages("new_and_my_open");
+  const tickets = all.filter(t => t.responder_id === agentId && t.status < 4);
   const otherAgents = AGENT_IDS.filter(id => id !== agentId);
   let reassigned = 0;
   for (let i = 0; i < tickets.length; i++) {
-    const newAgent = otherAgents[i % otherAgents.length];
-    const ok = await assignTicket(tickets[i].id, newAgent);
+    const ok = await assignTicket(tickets[i].id, otherAgents[i % otherAgents.length]);
     if (ok) reassigned++;
   }
   return { reassigned, total: tickets.length };
 }
 
-// ─── HTML DASHBOARD ───────────────────────────────────────────────────────────
+// ─── HTML ─────────────────────────────────────────────────────────────────────
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TrustVA · Ticket Desk</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0a0a0f;
-  --surface:#111118;
-  --surface2:#1a1a24;
-  --border:#2a2a38;
-  --accent:#6c63ff;
-  --accent2:#ff6584;
-  --green:#00e5a0;
-  --yellow:#ffd166;
-  --text:#e8e8f0;
-  --muted:#6b6b80;
-  --font-head:'Syne',sans-serif;
-  --font-body:'DM Sans',sans-serif;
-  --font-mono:'DM Mono',monospace;
+  --bg:#080810;--surface:#10101a;--surface2:#181825;--border:#252535;
+  --accent:#6c63ff;--accent2:#ff6584;--green:#00e5a0;--yellow:#ffd166;--orange:#ff9f43;
+  --text:#e8e8f4;--muted:#5a5a72;
+  --fh:'Syne',sans-serif;--fb:'DM Sans',sans-serif;--fm:'DM Mono',monospace;
 }
-body{background:var(--bg);color:var(--text);font-family:var(--font-body);min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;top:-200px;right:-200px;width:600px;height:600px;background:radial-gradient(circle,rgba(108,99,255,0.08) 0%,transparent 70%);pointer-events:none;z-index:0}
-body::after{content:'';position:fixed;bottom:-200px;left:-100px;width:500px;height:500px;background:radial-gradient(circle,rgba(255,101,132,0.06) 0%,transparent 70%);pointer-events:none;z-index:0}
+body{background:var(--bg);color:var(--text);font-family:var(--fb);min-height:100vh}
+body::before{content:'';position:fixed;top:-300px;right:-200px;width:700px;height:700px;background:radial-gradient(circle,rgba(108,99,255,0.07) 0%,transparent 65%);pointer-events:none}
+body::after{content:'';position:fixed;bottom:-200px;left:-100px;width:500px;height:500px;background:radial-gradient(circle,rgba(255,101,132,0.05) 0%,transparent 65%);pointer-events:none}
 
-header{position:relative;z-index:10;padding:20px 32px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;background:rgba(10,10,15,0.8);backdrop-filter:blur(12px);position:sticky;top:0}
-.logo{font-family:var(--font-head);font-size:20px;font-weight:800;letter-spacing:-0.5px}
+header{position:sticky;top:0;z-index:100;padding:16px 32px;border-bottom:1px solid var(--border);background:rgba(8,8,16,0.85);backdrop-filter:blur(16px);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.logo{font-family:var(--fh);font-size:18px;font-weight:800;letter-spacing:-0.5px}
 .logo span{color:var(--accent)}
-.header-right{display:flex;align-items:center;gap:12px}
-.live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
-.domain-badge{font-family:var(--font-mono);font-size:11px;color:var(--muted);background:var(--surface2);padding:4px 10px;border-radius:20px;border:1px solid var(--border)}
+.hright{display:flex;align-items:center;gap:10px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.dbadge{font-family:var(--fm);font-size:11px;color:var(--muted);background:var(--surface2);padding:3px 10px;border-radius:20px;border:1px solid var(--border)}
+.last-sync{font-size:11px;color:var(--muted)}
 
-main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:32px 24px}
+main{max-width:1280px;margin:0 auto;padding:28px 24px}
 
-.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:32px}
-.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px 24px;position:relative;overflow:hidden;transition:border-color 0.2s}
-.stat-card:hover{border-color:var(--accent)}
-.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
-.stat-card.blue::before{background:var(--accent)}
-.stat-card.red::before{background:var(--accent2)}
-.stat-card.green::before{background:var(--green)}
-.stat-card.yellow::before{background:var(--yellow)}
-.stat-num{font-family:var(--font-head);font-size:36px;font-weight:800;line-height:1;margin-bottom:6px}
-.stat-label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;font-weight:500}
+/* STATS */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:28px}
+.sc{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 20px;position:relative;overflow:hidden;cursor:default;transition:border-color .2s,transform .2s}
+.sc:hover{transform:translateY(-2px)}
+.sc::after{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:2px 2px 0 0}
+.sc.purple::after{background:var(--accent)}
+.sc.red::after{background:var(--accent2)}
+.sc.green::after{background:var(--green)}
+.sc.yellow::after{background:var(--yellow)}
+.sc.orange::after{background:var(--orange)}
+.sc.gray::after{background:var(--muted)}
+.sn{font-family:var(--fh);font-size:32px;font-weight:800;line-height:1;margin-bottom:5px}
+.sl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:500}
 
-.section{background:var(--surface);border:1px solid var(--border);border-radius:20px;margin-bottom:24px;overflow:hidden}
-.section-head{padding:20px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
-.section-title{font-family:var(--font-head);font-size:16px;font-weight:700;display:flex;align-items:center;gap:8px}
-.section-body{padding:24px}
+/* SECTIONS */
+.sec{background:var(--surface);border:1px solid var(--border);border-radius:18px;margin-bottom:20px;overflow:hidden}
+.sh{padding:18px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.st{font-family:var(--fh);font-size:15px;font-weight:700}
+.sb{padding:20px 22px}
 
-.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border-radius:10px;font-size:13px;font-weight:500;font-family:var(--font-body);cursor:pointer;border:none;transition:all 0.15s;white-space:nowrap}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{background:#7c74ff;transform:translateY(-1px)}
-.btn-danger{background:transparent;border:1px solid var(--accent2);color:var(--accent2)}
-.btn-danger:hover{background:rgba(255,101,132,0.1)}
-.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
-.btn-ghost:hover{border-color:var(--accent);color:var(--accent)}
-.btn-green{background:var(--green);color:#000}
-.btn-green:hover{opacity:0.85;transform:translateY(-1px)}
-.btn:disabled{opacity:0.4;cursor:not-allowed;transform:none!important}
+/* BUTTONS */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:9px;font-size:13px;font-weight:500;font-family:var(--fb);cursor:pointer;border:none;transition:all .15s;white-space:nowrap}
+.bp{background:var(--accent);color:#fff}.bp:hover{background:#7c74ff;transform:translateY(-1px)}
+.bg{background:var(--green);color:#000;font-weight:600}.bg:hover{opacity:.85;transform:translateY(-1px)}
+.bo{background:transparent;border:1px solid var(--border);color:var(--text)}.bo:hover{border-color:var(--accent);color:var(--accent)}
+.br{background:transparent;border:1px solid var(--accent2);color:var(--accent2)}.br:hover{background:rgba(255,101,132,.1)}
+.btn:disabled{opacity:.4;cursor:not-allowed;transform:none!important}
+.bgrp{display:flex;gap:8px;flex-wrap:wrap}
 
-.agent-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
-.agent-card{background:var(--surface2);border:1px solid var(--border);border-radius:14px;padding:16px;display:flex;align-items:center;gap:12px;transition:all 0.2s}
-.agent-card:hover{border-color:var(--accent);transform:translateY(-2px)}
-.avatar{width:40px;height:40px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-family:var(--font-head);font-size:14px;font-weight:700;flex-shrink:0}
-.agent-info{flex:1;min-width:0}
-.agent-name{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
-.agent-count{font-size:12px;color:var(--muted);font-family:var(--font-mono)}
-.agent-bar{height:3px;border-radius:2px;background:var(--border);margin-top:8px;overflow:hidden}
-.agent-bar-fill{height:100%;border-radius:2px;background:var(--accent);transition:width 0.6s ease}
-.reshuffle-btn{padding:6px 10px;font-size:11px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all 0.15s;white-space:nowrap;font-family:var(--font-body)}
-.reshuffle-btn:hover{border-color:var(--accent2);color:var(--accent2)}
+/* AGENT SELECT */
+.asg{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin-bottom:14px}
+.atog{display:flex;align-items:center;gap:8px;padding:9px 13px;border-radius:9px;border:1px solid var(--border);background:var(--surface2);cursor:pointer;transition:all .15s;user-select:none}
+.atog.on{border-color:var(--accent);background:rgba(108,99,255,.12)}
+.atog input{display:none}
+.ck{width:15px;height:15px;border-radius:4px;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:9px;transition:all .15s}
+.atog.on .ck{background:var(--accent);border-color:var(--accent);color:#fff}
+.tn{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-.agent-select-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-bottom:16px}
-.agent-toggle{display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:var(--surface2);cursor:pointer;transition:all 0.15s;user-select:none}
-.agent-toggle.selected{border-color:var(--accent);background:rgba(108,99,255,0.1)}
-.agent-toggle input{display:none}
-.check{width:16px;height:16px;border-radius:4px;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.15s;font-size:10px}
-.agent-toggle.selected .check{background:var(--accent);border-color:var(--accent)}
-.toggle-name{font-size:12px;font-weight:500}
+/* AGENT WORKLOAD GRID */
+.ag{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px}
+.ac{background:var(--surface2);border:1px solid var(--border);border-radius:13px;padding:14px;display:flex;align-items:center;gap:11px;transition:all .2s}
+.ac:hover{border-color:var(--accent);transform:translateY(-2px)}
+.av{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-family:var(--fh);font-size:13px;font-weight:700;flex-shrink:0}
+.ai{flex:1;min-width:0}
+.an{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
+.astat{font-size:11px;color:var(--muted);font-family:var(--fm)}
+.abar{height:3px;border-radius:2px;background:var(--border);margin-top:7px;overflow:hidden}
+.abf{height:100%;border-radius:2px;transition:width .6s ease}
+.sbtn{padding:5px 9px;font-size:11px;border-radius:7px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;font-family:var(--fb);white-space:nowrap}
+.sbtn:hover{border-color:var(--accent2);color:var(--accent2)}
 
-.ticket-list{max-height:300px;overflow-y:auto}
-.ticket-list::-webkit-scrollbar{width:4px}
-.ticket-list::-webkit-scrollbar-track{background:transparent}
-.ticket-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.ticket-row{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border);font-size:13px}
-.ticket-row:last-child{border-bottom:none}
-.ticket-id{font-family:var(--font-mono);font-size:11px;color:var(--accent);min-width:60px}
-.ticket-subj{flex:1;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ticket-agent{font-size:11px;color:var(--green);font-family:var(--font-mono);white-space:nowrap}
-.ticket-fail{font-size:11px;color:var(--accent2);font-family:var(--font-mono)}
+/* TICKET LIST */
+.tlist{max-height:320px;overflow-y:auto;border-radius:10px}
+.tlist::-webkit-scrollbar{width:3px}
+.tlist::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.tr{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px}
+.tr:last-child{border-bottom:none}
+.tid{font-family:var(--fm);font-size:11px;color:var(--accent);min-width:58px;flex-shrink:0}
+.tsub{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{display:inline-block;padding:1px 7px;border-radius:20px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;flex-shrink:0}
+.tag-open{background:rgba(108,99,255,.15);color:var(--accent)}
+.tag-pending{background:rgba(255,209,102,.15);color:var(--yellow)}
+.tag-overdue{background:rgba(255,101,132,.15);color:var(--accent2)}
+.tag-unassigned{background:rgba(255,159,67,.15);color:var(--orange)}
+.tag-ok{background:rgba(0,229,160,.15);color:var(--green)}
+.tag-fail{background:rgba(255,101,132,.15);color:var(--accent2)}
+.tagent{font-size:11px;color:var(--green);font-family:var(--fm);white-space:nowrap;flex-shrink:0}
+.pri-1{color:var(--muted)} .pri-2{color:var(--yellow)} .pri-3{color:var(--orange)} .pri-4{color:var(--accent2)}
 
-.toast{position:fixed;bottom:24px;right:24px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px 20px;font-size:13px;z-index:1000;transform:translateY(100px);opacity:0;transition:all 0.3s;max-width:320px}
+/* RESULT */
+.rsum{display:flex;gap:16px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+
+/* TOAST */
+.toast{position:fixed;bottom:24px;right:24px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:12px 18px;font-size:13px;z-index:9999;transform:translateY(100px);opacity:0;transition:all .3s;max-width:300px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
 .toast.show{transform:translateY(0);opacity:1}
 .toast.success{border-color:var(--green);color:var(--green)}
 .toast.error{border-color:var(--accent2);color:var(--accent2)}
+.toast.info{border-color:var(--accent);color:var(--accent)}
 
-.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:spin 0.7s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-.empty{text-align:center;padding:40px;color:var(--muted);font-size:14px}
-.tag{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em}
-.tag-open{background:rgba(108,99,255,0.15);color:var(--accent)}
-.tag-unassigned{background:rgba(255,101,132,0.15);color:var(--accent2)}
-
-@media(max-width:600px){
-  header{padding:14px 16px}
-  main{padding:16px}
-  .stats-row{grid-template-columns:1fr 1fr}
-  .stat-num{font-size:28px}
-}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.empty{text-align:center;padding:36px;color:var(--muted);font-size:13px}
+.scnt{font-size:12px;color:var(--muted);margin-top:6px}
+.divider{height:1px;background:var(--border);margin:14px 0}
+.priority-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 </style>
 </head>
 <body>
 <header>
   <div class="logo">Trust<span>VA</span> · Ticket Desk</div>
-  <div class="header-right">
-    <div class="live-dot"></div>
-    <div class="domain-badge" id="domain-label">loading...</div>
-    <button class="btn btn-ghost" onclick="loadDashboard()" id="refresh-btn">↻ Refresh</button>
+  <div class="hright">
+    <div class="dot"></div>
+    <div class="dbadge" id="dlbl">connecting...</div>
+    <span class="last-sync" id="lsync"></span>
+    <button class="btn bo" id="rbtn" onclick="loadAll()">↻ Refresh</button>
   </div>
 </header>
 
 <main>
-  <!-- STATS -->
-  <div class="stats-row">
-    <div class="stat-card blue">
-      <div class="stat-num" id="stat-open">—</div>
-      <div class="stat-label">Open Tickets</div>
-    </div>
-    <div class="stat-card red">
-      <div class="stat-num" id="stat-unassigned">—</div>
-      <div class="stat-label">Unassigned</div>
-    </div>
-    <div class="stat-card green">
-      <div class="stat-num" id="stat-assigned">—</div>
-      <div class="stat-label">Assigned</div>
-    </div>
-    <div class="stat-card yellow">
-      <div class="stat-num" id="stat-agents">0</div>
-      <div class="stat-label">Active Agents</div>
-    </div>
+  <!-- STATS ROW -->
+  <div class="stats">
+    <div class="sc purple"><div class="sn" id="s-open">—</div><div class="sl">Open</div></div>
+    <div class="sc red"><div class="sn" id="s-unassigned">—</div><div class="sl">Unassigned</div></div>
+    <div class="sc green"><div class="sn" id="s-assigned">—</div><div class="sl">Assigned</div></div>
+    <div class="sc orange"><div class="sn" id="s-unresolved">—</div><div class="sl">Unresolved</div></div>
+    <div class="sc yellow"><div class="sn" id="s-pending">—</div><div class="sl">Pending</div></div>
+    <div class="sc gray"><div class="sn" id="s-overdue">—</div><div class="sl">Overdue</div></div>
+    <div class="sc purple"><div class="sn">${AGENT_IDS.length}</div><div class="sl">Agents</div></div>
   </div>
 
-  <!-- QUICK ASSIGN ALL -->
-  <div class="section">
-    <div class="section-head">
-      <div class="section-title">⚡ Assign All Unassigned Now</div>
-      <button class="btn btn-green" id="assign-all-btn" onclick="assignAll()">
-        Assign All Equally
-      </button>
+  <!-- ASSIGN UNASSIGNED NOW -->
+  <div class="sec">
+    <div class="sh">
+      <div class="st">⚡ Assign Unassigned Tickets Now</div>
+      <button class="btn bg" id="aall-btn" onclick="assignAllNow()"><span id="aall-ico">→</span> Assign All Equally</button>
     </div>
-    <div class="section-body">
-      <div id="assign-result" class="empty">Click "Assign All Equally" to distribute all unassigned open tickets across all 14 agents.</div>
+    <div class="sb">
+      <div id="aall-result" class="empty">Click "Assign All Equally" to distribute all <strong id="ucount-hint">—</strong> unassigned tickets equally across all 14 agents.</div>
     </div>
   </div>
 
   <!-- ASSIGN TO SPECIFIC AGENTS -->
-  <div class="section">
-    <div class="section-head">
-      <div class="section-title">🎯 Assign to Specific Agents</div>
-      <div style="display:flex;gap:8px">
-        <button class="btn btn-ghost" onclick="selectAll()">Select All</button>
-        <button class="btn btn-ghost" onclick="selectNone()">Clear</button>
-        <button class="btn btn-primary" id="assign-selected-btn" onclick="assignSelected()">Assign to Selected</button>
+  <div class="sec">
+    <div class="sh">
+      <div>
+        <div class="st">🎯 Assign to Specific Agents</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px">Select agents → assign unassigned first, then unresolved tickets equally</div>
+      </div>
+      <div class="bgrp">
+        <button class="btn bo" onclick="selAll()">All</button>
+        <button class="btn bo" onclick="selNone()">None</button>
+        <button class="btn bo" id="asel-unassign-btn" onclick="assignSelectedUnassigned()">Unassigned Only</button>
+        <button class="btn bp" id="asel-btn" onclick="assignSelectedFull()">Unassigned + Unresolved</button>
       </div>
     </div>
-    <div class="section-body">
-      <div class="agent-select-grid" id="agent-select-grid"></div>
-      <div id="selected-count" style="font-size:12px;color:var(--muted);margin-top:4px">0 agents selected</div>
+    <div class="sb">
+      <div class="asg" id="asel-grid"></div>
+      <div class="scnt" id="scnt">0 agents selected</div>
+      <div id="asel-result"></div>
+    </div>
+  </div>
+
+  <!-- UNRESOLVED TICKETS -->
+  <div class="sec">
+    <div class="sh">
+      <div>
+        <div class="st">🔴 Unresolved Tickets</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px">All open + pending tickets not yet resolved</div>
+      </div>
+      <div class="bgrp">
+        <button class="btn bo" onclick="filterUnresolved('all')">All</button>
+        <button class="btn bo" onclick="filterUnresolved('unassigned')">Unassigned</button>
+        <button class="btn bo" onclick="filterUnresolved('overdue')">Overdue</button>
+      </div>
+    </div>
+    <div class="sb">
+      <div class="tlist" id="unresolved-list"><div class="empty">Loading...</div></div>
     </div>
   </div>
 
   <!-- AGENT WORKLOAD -->
-  <div class="section">
-    <div class="section-head">
-      <div class="section-title">👥 Agent Workload</div>
-      <button class="btn btn-ghost" onclick="loadAgents()">↻ Refresh</button>
+  <div class="sec">
+    <div class="sh">
+      <div class="st">👥 Agent Workload</div>
+      <button class="btn bo" onclick="loadAgents()">↻ Refresh</button>
     </div>
-    <div class="section-body">
-      <div class="agent-grid" id="agent-grid">
-        <div class="empty">Loading agents...</div>
-      </div>
+    <div class="sb">
+      <div class="ag" id="agent-grid"><div class="empty">Loading...</div></div>
     </div>
   </div>
 </main>
@@ -295,234 +368,251 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:32px 24p
 <div class="toast" id="toast"></div>
 
 <script>
-const AGENTS = ${JSON.stringify(AGENT_IDS.map((id, i) => ({ id, name: AGENT_NAMES[i] || "Agent "+(i+1) })))};
-const COLORS = ["#6c63ff","#ff6584","#00e5a0","#ffd166","#38bdf8","#fb923c","#a78bfa","#34d399","#f472b6","#60a5fa","#facc15","#4ade80","#f87171","#818cf8"];
+const AGENTS = ${JSON.stringify(AGENT_IDS.map((id,i) => ({ id, name: AGENT_NAMES[i]||"Agent "+(i+1) })))};
+const COLS = ["#6c63ff","#ff6584","#00e5a0","#ffd166","#ff9f43","#38bdf8","#a78bfa","#34d399","#f472b6","#60a5fa","#facc15","#4ade80","#f87171","#818cf8"];
+let selAgents = new Set(AGENTS.map(a=>a.id));
+let unresolvedData = [];
 
-let selectedAgents = new Set(AGENTS.map(a => a.id));
-
-function initAgentSelect() {
-  const grid = document.getElementById("agent-select-grid");
-  grid.innerHTML = AGENTS.map(a => \`
-    <label class="agent-toggle selected" id="toggle-\${a.id}">
-      <input type="checkbox" checked onchange="toggleAgent(\${a.id}, this.checked)">
-      <div class="check">✓</div>
-      <span class="toggle-name">\${a.name}</span>
-    </label>
-  \`).join("");
-  updateSelectedCount();
+// INIT AGENT SELECT
+function initSel() {
+  document.getElementById("asel-grid").innerHTML = AGENTS.map(a =>
+    '<label class="atog on" id="tog-'+a.id+'"><input type="checkbox" checked onchange="togAgent('+a.id+',this.checked)"><div class="ck">✓</div><span class="tn">'+a.name+'</span></label>'
+  ).join("");
+  updScnt();
 }
 
-function toggleAgent(id, checked) {
-  if (checked) selectedAgents.add(id);
-  else selectedAgents.delete(id);
-  const el = document.getElementById("toggle-"+id);
-  if (el) el.className = "agent-toggle" + (checked ? " selected" : "");
-  updateSelectedCount();
+function togAgent(id, on) {
+  on ? selAgents.add(id) : selAgents.delete(id);
+  const el = document.getElementById("tog-"+id);
+  if(el){ el.className = "atog"+(on?" on":""); el.querySelector(".ck").textContent = on?"✓":""; }
+  updScnt();
 }
+function selAll()  { AGENTS.forEach(a=>togAgent(a.id,true)); }
+function selNone() { AGENTS.forEach(a=>togAgent(a.id,false)); }
+function updScnt() { document.getElementById("scnt").textContent = selAgents.size+" agent"+(selAgents.size===1?"":"s")+" selected"; }
 
-function selectAll() {
-  AGENTS.forEach(a => { selectedAgents.add(a.id); document.getElementById("toggle-"+a.id).className="agent-toggle selected"; document.querySelector("#toggle-"+a.id+" input").checked=true; });
-  updateSelectedCount();
-}
-
-function selectNone() {
-  AGENTS.forEach(a => { selectedAgents.delete(a.id); document.getElementById("toggle-"+a.id).className="agent-toggle"; document.querySelector("#toggle-"+a.id+" input").checked=false; });
-  updateSelectedCount();
-}
-
-function updateSelectedCount() {
-  document.getElementById("selected-count").textContent = selectedAgents.size + " agent" + (selectedAgents.size===1?"":"s") + " selected";
-}
-
-async function loadDashboard() {
-  document.getElementById("domain-label").textContent = "${DOMAIN}";
-  document.getElementById("stat-agents").textContent = AGENTS.length;
-  const btn = document.getElementById("refresh-btn");
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+// LOAD EVERYTHING
+async function loadAll() {
+  const btn = document.getElementById("rbtn");
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span>';
+  document.getElementById("dlbl").textContent = "${DOMAIN}";
   try {
-    const res = await fetch("/api/stats");
-    const data = await res.json();
-    document.getElementById("stat-open").textContent = data.open;
-    document.getElementById("stat-unassigned").textContent = data.unassigned;
-    document.getElementById("stat-assigned").textContent = data.assigned;
+    const r = await fetch("/api/stats");
+    const d = await r.json();
+    document.getElementById("s-open").textContent       = d.open;
+    document.getElementById("s-unassigned").textContent = d.unassigned;
+    document.getElementById("s-assigned").textContent   = d.assigned;
+    document.getElementById("s-unresolved").textContent = d.unresolved;
+    document.getElementById("s-pending").textContent    = d.pending;
+    document.getElementById("s-overdue").textContent    = d.overdue;
+    document.getElementById("ucount-hint").textContent  = d.unassigned;
+    unresolvedData = d.unresolvedTickets || [];
+    renderUnresolved(unresolvedData);
     await loadAgents();
-  } catch(e) { showToast("Failed to load stats", "error"); }
-  btn.disabled = false; btn.innerHTML = "↻ Refresh";
+    document.getElementById("lsync").textContent = "synced "+new Date().toLocaleTimeString("en-IN");
+  } catch(e){ toast("Failed to load — check Railway logs","error"); }
+  btn.disabled=false; btn.innerHTML="↻ Refresh";
 }
 
+// UNRESOLVED LIST
+function renderUnresolved(tickets) {
+  const el = document.getElementById("unresolved-list");
+  if(!tickets.length){ el.innerHTML='<div class="empty">No unresolved tickets 🎉</div>'; return; }
+  const STATUS = {2:"open",3:"pending",4:"resolved"};
+  const PCOLOR = {1:"#5a5a72",2:"#ffd166",3:"#ff9f43",4:"#ff6584"};
+  el.innerHTML = tickets.map(t => {
+    const isOverdue = t.due_by && new Date(t.due_by)<new Date() && t.status<4;
+    const agentName = AGENTS.find(a=>a.id===t.responder_id)?.name || "";
+    return '<div class="tr">'+
+      '<span class="tid">#'+t.id+'</span>'+
+      '<div class="priority-dot" style="background:'+PCOLOR[t.priority||1]+'" title="Priority '+t.priority+'"></div>'+
+      '<span class="tsub">'+esc(t.subject)+'</span>'+
+      (isOverdue?'<span class="tag tag-overdue">overdue</span>':'<span class="tag tag-'+(STATUS[t.status]||"open")+'">'+( STATUS[t.status]||"open")+'</span>')+
+      (!t.responder_id?'<span class="tag tag-unassigned">unassigned</span>':'')+
+      (agentName?'<span class="tagent">'+esc(agentName)+'</span>':'')+
+    '</div>';
+  }).join("");
+}
+
+function filterUnresolved(mode) {
+  if(mode==="all")        renderUnresolved(unresolvedData);
+  else if(mode==="unassigned") renderUnresolved(unresolvedData.filter(t=>!t.responder_id));
+  else if(mode==="overdue")    renderUnresolved(unresolvedData.filter(t=>t.due_by&&new Date(t.due_by)<new Date()&&t.status<4));
+}
+
+// AGENT WORKLOAD
 async function loadAgents() {
   const grid = document.getElementById("agent-grid");
-  grid.innerHTML = '<div class="empty">Loading...</div>';
+  grid.innerHTML='<div class="empty">Loading...</div>';
   try {
-    const res = await fetch("/api/agents");
-    const data = await res.json();
-    const max = Math.max(...data.map(a => a.count), 1);
-    grid.innerHTML = data.map((a, i) => \`
-      <div class="agent-card">
-        <div class="avatar" style="background:\${COLORS[i%COLORS.length]}22;color:\${COLORS[i%COLORS.length]}">\${a.name.split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2)}</div>
-        <div class="agent-info">
-          <div class="agent-name">\${a.name}</div>
-          <div class="agent-count">\${a.count} open tickets</div>
-          <div class="agent-bar"><div class="agent-bar-fill" style="width:\${Math.round(a.count/max*100)}%;background:\${COLORS[i%COLORS.length]}"></div></div>
-        </div>
-        <button class="reshuffle-btn" onclick="reshuffleAgent(\${a.id}, '\${a.name}')">Shuffle</button>
-      </div>
-    \`).join("");
-  } catch(e) { grid.innerHTML = '<div class="empty">Failed to load agents</div>'; }
+    const r = await fetch("/api/agents");
+    const d = await r.json();
+    const maxOpen = Math.max(...d.map(a=>a.count),1);
+    grid.innerHTML = d.map((a,i)=>
+      '<div class="ac">'+
+        '<div class="av" style="background:'+COLS[i%COLS.length]+'22;color:'+COLS[i%COLS.length]+'">'+initials(a.name)+'</div>'+
+        '<div class="ai">'+
+          '<div class="an">'+esc(a.name)+'</div>'+
+          '<div class="astat">'+a.count+' open · '+a.unresolved+' unresolved</div>'+
+          '<div class="abar"><div class="abf" style="width:'+Math.round(a.count/maxOpen*100)+'%;background:'+COLS[i%COLS.length]+'"></div></div>'+
+        '</div>'+
+        '<button class="sbtn" onclick="doReshuffle('+a.id+',\''+esc(a.name)+'\')">Shuffle</button>'+
+      '</div>'
+    ).join("");
+  } catch(e){ grid.innerHTML='<div class="empty">Failed to load agents</div>'; }
 }
 
-async function assignAll() {
-  const btn = document.getElementById("assign-all-btn");
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Assigning...';
+// ASSIGN ALL
+async function assignAllNow() {
+  const btn = document.getElementById("aall-btn");
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span> Assigning...';
   try {
-    const res = await fetch("/api/assign", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds: AGENTS.map(a=>a.id) }) });
-    const data = await res.json();
-    showResult(data);
-    await loadDashboard();
-  } catch(e) { showToast("Assignment failed", "error"); }
-  btn.disabled = false; btn.innerHTML = "Assign All Equally";
+    const r = await fetch("/api/assign-unassigned",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentIds:AGENTS.map(a=>a.id)})});
+    const d = await r.json();
+    showAssignResult(d,"aall-result");
+    await loadAll();
+  } catch(e){ toast("Assignment failed","error"); }
+  btn.disabled=false; btn.innerHTML='→ Assign All Equally';
 }
 
-async function assignSelected() {
-  if (selectedAgents.size === 0) { showToast("Select at least one agent!", "error"); return; }
-  const btn = document.getElementById("assign-selected-btn");
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Assigning...';
+// ASSIGN SELECTED — unassigned only
+async function assignSelectedUnassigned() {
+  if(!selAgents.size){ toast("Select at least one agent!","error"); return; }
+  const btn=document.getElementById("asel-unassign-btn");
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span>';
   try {
-    const res = await fetch("/api/assign", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds: [...selectedAgents] }) });
-    const data = await res.json();
-    showResult(data);
-    await loadDashboard();
-  } catch(e) { showToast("Assignment failed", "error"); }
-  btn.disabled = false; btn.innerHTML = "Assign to Selected";
+    const r = await fetch("/api/assign-unassigned",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentIds:[...selAgents]})});
+    const d = await r.json();
+    showAssignResult(d,"asel-result");
+    await loadAll();
+  } catch(e){ toast("Failed","error"); }
+  btn.disabled=false; btn.innerHTML='Unassigned Only';
 }
 
-async function reshuffleAgent(agentId, agentName) {
-  if (!confirm("Reassign all of " + agentName + "'s tickets to other agents?")) return;
-  showToast("Reshuffling " + agentName + "...", "");
+// ASSIGN SELECTED — unassigned + unresolved
+async function assignSelectedFull() {
+  if(!selAgents.size){ toast("Select at least one agent!","error"); return; }
+  const btn=document.getElementById("asel-btn");
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span> Working...';
   try {
-    const res = await fetch("/api/reshuffle", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentId }) });
-    const data = await res.json();
-    showToast("Moved " + data.reassigned + " tickets from " + agentName, "success");
-    await loadDashboard();
-  } catch(e) { showToast("Reshuffle failed", "error"); }
+    const r = await fetch("/api/assign-full",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentIds:[...selAgents]})});
+    const d = await r.json();
+    showAssignResult(d,"asel-result");
+    await loadAll();
+  } catch(e){ toast("Failed","error"); }
+  btn.disabled=false; btn.innerHTML='Unassigned + Unresolved';
 }
 
-function showResult(data) {
-  if (data.assigned === 0) {
-    document.getElementById("assign-result").innerHTML = '<div class="empty">✅ No unassigned tickets found — everything is already assigned!</div>';
-    showToast("All tickets already assigned!", "success");
-    return;
+async function doReshuffle(id, name) {
+  if(!confirm("Move all of "+name+"'s tickets to other agents?")) return;
+  toast("Reshuffling "+name+"...","info");
+  try {
+    const r = await fetch("/api/reshuffle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentId:id})});
+    const d = await r.json();
+    toast("Moved "+d.reassigned+" tickets from "+name,"success");
+    await loadAll();
+  } catch(e){ toast("Reshuffle failed","error"); }
+}
+
+function showAssignResult(data, elId) {
+  const el = document.getElementById(elId);
+  if(data.assigned===0){
+    el.innerHTML='<div class="empty" style="padding:16px">✅ No unassigned tickets — all clear!</div>';
+    toast("Nothing to assign!","success"); return;
   }
-  const rows = (data.tickets || []).slice(0, 50).map(t => \`
-    <div class="ticket-row">
-      <span class="ticket-id">#\${t.id}</span>
-      <span class="ticket-subj">\${t.subject || "No subject"}</span>
-      \${t.ok ? '<span class="ticket-agent">→ '+t.agent+'</span>' : '<span class="ticket-fail">failed</span>'}
-    </div>
-  \`).join("");
-  document.getElementById("assign-result").innerHTML = \`
-    <div style="display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap">
-      <span style="color:var(--green);font-weight:600">✅ \${data.assigned} assigned</span>
-      \${data.failed > 0 ? '<span style="color:var(--accent2)">❌ '+data.failed+' failed</span>' : ''}
-    </div>
-    <div class="ticket-list">\${rows}\${data.tickets.length > 50 ? '<div style="padding:10px 0;color:var(--muted);font-size:12px">...and '+(data.tickets.length-50)+' more</div>' : ''}</div>
-  \`;
-  showToast(data.assigned + " tickets assigned!", "success");
+  const rows = (data.tickets||[]).slice(0,60).map(t=>
+    '<div class="tr">'+
+      '<span class="tid">#'+t.id+'</span>'+
+      '<span class="tag '+(t.type==="unassigned"?"tag-unassigned":"tag-pending")+'">'+t.type+'</span>'+
+      '<span class="tsub">'+esc(t.subject)+'</span>'+
+      (t.ok?'<span class="tagent">→ '+esc(t.agent||"")+'</span>':'<span class="tag tag-fail">failed</span>')+
+    '</div>'
+  ).join("");
+  el.innerHTML =
+    '<div class="divider"></div>'+
+    '<div class="rsum">'+
+      '<span style="color:var(--green);font-weight:600">✅ '+data.assigned+' assigned</span>'+
+      (data.failed>0?'<span style="color:var(--accent2)">❌ '+data.failed+' failed</span>':'')+
+    '</div>'+
+    '<div class="tlist">'+rows+(data.tickets.length>60?'<div style="padding:8px 0;color:var(--muted);font-size:12px">...and '+(data.tickets.length-60)+' more</div>':'')+
+    '</div>';
+  toast(data.assigned+" tickets assigned!","success");
 }
 
-function showToast(msg, type) {
-  const t = document.getElementById("toast");
-  t.textContent = msg;
-  t.className = "toast show" + (type ? " "+type : "");
-  clearTimeout(window._toastTimer);
-  window._toastTimer = setTimeout(() => t.className = "toast", 3000);
+function initials(n){ return (n||"?").split(" ").map(w=>w[0]||"").join("").toUpperCase().slice(0,2)||"?"; }
+function esc(s){ return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+function toast(msg,type){
+  const t=document.getElementById("toast");
+  t.textContent=msg; t.className="toast show"+(type?" "+type:"");
+  clearTimeout(window._tt);
+  window._tt=setTimeout(()=>t.className="toast",3200);
 }
 
-initAgentSelect();
-loadDashboard();
-setInterval(loadDashboard, 60000);
+initSel();
+loadAll();
+setInterval(loadAll, 90000); // auto-refresh every 90s
 </script>
 </body>
 </html>`;
 
-// ─── HTTP SERVER + API ────────────────────────────────────────────────────────
+// ─── SERVER ───────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  const parsed = url.parse(req.url, true);
-  const path = parsed.pathname;
+  const p = url.parse(req.url).pathname;
+  res.setHeader("Content-Type","application/json");
 
-  res.setHeader("Content-Type", "application/json");
+  if (p==="/" || p==="/dashboard") {
+    res.setHeader("Content-Type","text/html"); res.writeHead(200); res.end(HTML); return;
+  }
 
-  if (path === "/" || path === "/dashboard") {
-    res.setHeader("Content-Type", "text/html");
-    res.writeHead(200);
-    res.end(HTML);
+  if (p==="/api/stats") {
+    try { const d=await getStats(); res.writeHead(200); res.end(JSON.stringify(d)); }
+    catch(e){ res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
     return;
   }
 
-  if (path === "/api/stats") {
-    try {
-      const tickets = await getAllOpenTickets();
-      const unassigned = tickets.filter(t => !t.responder_id).length;
-      res.writeHead(200);
-      res.end(JSON.stringify({ open: tickets.length, unassigned, assigned: tickets.length - unassigned }));
-    } catch(e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
+  if (p==="/api/agents") {
+    try { const d=await getAgentCounts(); res.writeHead(200); res.end(JSON.stringify(d)); }
+    catch(e){ res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
     return;
   }
 
-  if (path === "/api/agents") {
-    try {
-      const tickets = await getAllOpenTickets();
-      const counts = {};
-      AGENT_IDS.forEach(id => counts[id] = 0);
-      tickets.forEach(t => { if (t.responder_id && counts[t.responder_id] !== undefined) counts[t.responder_id]++; });
-      const result = AGENT_IDS.map((id, i) => ({ id, name: AGENT_NAMES[i] || "Agent "+(i+1), count: counts[id] }));
-      res.writeHead(200);
-      res.end(JSON.stringify(result));
-    } catch(e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
-    return;
+  if (p==="/api/assign-unassigned" && req.method==="POST") {
+    let b=""; req.on("data",c=>b+=c);
+    req.on("end", async()=>{
+      try { const {agentIds}=JSON.parse(b); res.writeHead(200); res.end(JSON.stringify(await runUnassignedOnly(agentIds))); }
+      catch(e){ res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
+    }); return;
   }
 
-  if (path === "/api/assign" && req.method === "POST") {
-    let body = "";
-    req.on("data", c => body += c);
-    req.on("end", async () => {
-      try {
-        const { agentIds } = JSON.parse(body);
-        const result = await runAssignment(agentIds);
-        res.writeHead(200);
-        res.end(JSON.stringify(result));
-      } catch(e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
-    });
-    return;
+  if (p==="/api/assign-full" && req.method==="POST") {
+    let b=""; req.on("data",c=>b+=c);
+    req.on("end", async()=>{
+      try { const {agentIds}=JSON.parse(b); res.writeHead(200); res.end(JSON.stringify(await runFullAssignment(agentIds))); }
+      catch(e){ res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
+    }); return;
   }
 
-  if (path === "/api/reshuffle" && req.method === "POST") {
-    let body = "";
-    req.on("data", c => body += c);
-    req.on("end", async () => {
-      try {
-        const { agentId } = JSON.parse(body);
-        const result = await reshuffleAgent(agentId);
-        res.writeHead(200);
-        res.end(JSON.stringify(result));
-      } catch(e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
-    });
-    return;
+  if (p==="/api/reshuffle" && req.method==="POST") {
+    let b=""; req.on("data",c=>b+=c);
+    req.on("end", async()=>{
+      try { const {agentId}=JSON.parse(b); res.writeHead(200); res.end(JSON.stringify(await reshuffleAgent(agentId))); }
+      catch(e){ res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
+    }); return;
   }
 
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: "not found" }));
+  res.writeHead(404); res.end(JSON.stringify({error:"not found"}));
 });
 
-server.listen(PORT, () => console.log("🌐 Dashboard live on port " + PORT));
+server.listen(PORT, ()=>console.log("🌐 Dashboard on port "+PORT));
 
-// ─── CRON SCHEDULE ────────────────────────────────────────────────────────────
-cron.schedule("0 4 * * 1-6",       () => runAssignment(AGENT_IDS), { timezone: "Asia/Kolkata" });
-cron.schedule("*/30 3-14 * * 1-6", async () => {
-  const t = await getAllOpenUnassigned();
-  if (t.length >= 20) { console.log("🚨 Surge! Auto-assigning..."); await runAssignment(AGENT_IDS); }
-}, { timezone: "Asia/Kolkata" });
+// CRON 9:30 AM IST
+cron.schedule("0 4 * * 1-6", ()=>runUnassignedOnly(AGENT_IDS), {timezone:"Asia/Kolkata"});
+cron.schedule("*/30 3-14 * * 1-6", async()=>{
+  const all = await fetchAllPages("new_and_my_open");
+  const u = all.filter(t=>t.status===2&&!t.responder_id);
+  if(u.length>=20){ console.log("🚨 Surge "+u.length+" — assigning"); await runUnassignedOnly(AGENT_IDS); }
+}, {timezone:"Asia/Kolkata"});
 
-console.log("🚀 TrustVA Ticket Desk running!");
-console.log("🌐 Open your Railway URL in the browser to see the dashboard");
-console.log("👥 " + AGENT_IDS.length + " agents loaded: " + AGENT_NAMES.join(", "));
+console.log("🚀 TrustVA Ticket Desk is live!");
+console.log("👥 "+AGENT_IDS.length+" agents | Auto-assign 9:30 AM IST daily");
