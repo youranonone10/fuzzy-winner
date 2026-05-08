@@ -1,5 +1,6 @@
 const cron  = require("node-cron");
 const axios = require("axios");
+const http  = require("http");
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const DOMAIN      = process.env.FRESHDESK_DOMAIN;
@@ -8,6 +9,15 @@ const AGENT_IDS   = process.env.AGENT_IDS.split(",").map(Number);
 const AGENT_NAMES = process.env.AGENT_NAMES.split(",").map(s => s.trim());
 
 const auth = { username: API_KEY, password: "X" };
+
+// ─── KEEP-ALIVE WEB SERVER (Railway requires this) ────────────────────────────
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("Freshdesk Auto-Assign Bot is running!");
+}).listen(PORT, () => {
+  console.log("🌐 Keep-alive server on port " + PORT);
+});
 
 // ─── GET ALL OPEN + UNASSIGNED TICKETS ────────────────────────────────────────
 async function getAllOpenUnassigned() {
@@ -28,7 +38,6 @@ async function getAllOpenUnassigned() {
 }
 
 // ─── ASSIGN ONE TICKET TO ONE AGENT ──────────────────────────────────────────
-// Only sets responder_id. Never changes status or anything else.
 async function assignTicket(ticketId, agentId) {
   try {
     await axios.put(
@@ -65,7 +74,7 @@ async function runAssignment(triggeredBy) {
 
   for (let i = 0; i < tickets.length; i++) {
     const ticket  = tickets[i];
-    const agentId = AGENT_IDS[i % AGENT_IDS.length]; // equal round-robin
+    const agentId = AGENT_IDS[i % AGENT_IDS.length];
     const ok = await assignTicket(ticket.id, agentId);
     if (ok) {
       perAgent[agentId].count++;
@@ -84,7 +93,7 @@ async function runAssignment(triggeredBy) {
   });
 }
 
-// ─── SURGE CHECK: auto-assign if 20+ new tickets pile up ─────────────────────
+// ─── SURGE CHECK ─────────────────────────────────────────────────────────────
 let lastCount = 0;
 async function checkSurge() {
   const tickets = await getAllOpenUnassigned();
@@ -93,15 +102,13 @@ async function checkSurge() {
     console.log("🚨 Surge! " + spike + " new tickets — auto-assigning now");
     await runAssignment("surge-auto");
   } else {
-    console.log("📈 Surge check: " + tickets.length + " unassigned (+" + Math.max(0,spike) + " new)");
+    console.log("📈 Surge check: " + tickets.length + " unassigned (+" + Math.max(0, spike) + " new)");
   }
   lastCount = tickets.length;
 }
 
 // ─── SCHEDULE (IST) ───────────────────────────────────────────────────────────
-// 9:30 AM IST = 4:00 AM UTC — runs Mon to Sat
 cron.schedule("0 4 * * 1-6",       () => runAssignment("9:30am"), { timezone: "Asia/Kolkata" });
-// Surge check every 30 min during work hours
 cron.schedule("*/30 3-14 * * 1-6", checkSurge,                    { timezone: "Asia/Kolkata" });
 
 console.log("🚀 Freshdesk Auto-Assign Bot is running!");
