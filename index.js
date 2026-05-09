@@ -10,47 +10,41 @@ const AGENT_NAMES = process.env.AGENT_NAMES.split(",").map(s => s.trim());
 const PORT        = process.env.PORT || 3000;
 const auth        = { username: API_KEY, password: "X" };
 
-// ── STARTUP VALIDATION ────────────────────────────────────────────────────────
 console.log("ENV CHECK:");
 console.log("  DOMAIN      = " + DOMAIN);
 console.log("  API_KEY     = " + (API_KEY ? API_KEY.slice(0,6)+"..." : "MISSING!"));
 console.log("  AGENT_IDS   = " + AGENT_IDS.length + " agents");
 console.log("  PORT        = " + PORT);
 
-if (!DOMAIN || !API_KEY) {
-  console.error("FATAL: FRESHDESK_DOMAIN or FRESHDESK_API_KEY is missing from env!");
-  process.exit(1);
-}
-
 // ── FRESHDESK API ─────────────────────────────────────────────────────────────
-async function fdGet(path) {
-  const res = await axios.get("https://" + DOMAIN + "/api/v2/" + path, {
-    auth,
-    headers: { "Content-Type": "application/json" },
-    timeout: 15000
-  });
-  return res.data;
-}
-
-async function fdPut(path, data) {
-  const res = await axios.put("https://" + DOMAIN + "/api/v2/" + path, data, {
-    auth,
-    headers: { "Content-Type": "application/json" },
-    timeout: 15000
-  });
-  return res.data;
-}
-
 async function getAllTickets(filter) {
   let page = 1, all = [];
   while (true) {
-    const batch = await fdGet("tickets?filter=" + filter + "&per_page=100&page=" + page);
-    all = all.concat(batch);
-    if (batch.length < 100) break;
+    const res = await axios.get(
+      "https://" + DOMAIN + "/api/v2/tickets?filter=" + filter + "&per_page=100&page=" + page,
+      { auth, timeout: 15000 }
+    );
+    all = all.concat(res.data);
+    if (res.data.length < 100) break;
     page++;
-    if (page > 10) break; // safety cap at 1000 tickets
+    if (page > 10) break;
   }
   return all;
+}
+
+async function assignOne(ticketId, agentId) {
+  try {
+    await axios.put(
+      "https://" + DOMAIN + "/api/v2/tickets/" + ticketId,
+      { responder_id: Number(agentId) },
+      { auth, headers: { "Content-Type": "application/json" }, timeout: 15000 }
+    );
+    return true;
+  } catch(e) {
+    const msg = e.response && e.response.data ? JSON.stringify(e.response.data) : e.message;
+    console.error("  assign failed #" + ticketId + ": " + msg);
+    return false;
+  }
 }
 
 // ── DATA FUNCTIONS ────────────────────────────────────────────────────────────
@@ -79,98 +73,65 @@ async function getAgentWorkload() {
   ]);
   const openCnt = {}, unresCnt = {};
   AGENT_IDS.forEach(id => { openCnt[id] = 0; unresCnt[id] = 0; });
-
   newOpen.filter(t => t.status === 2).forEach(t => {
-    if (t.responder_id && openCnt[t.responder_id] !== undefined)
-      openCnt[t.responder_id]++;
+    if (t.responder_id && openCnt[t.responder_id] !== undefined) openCnt[t.responder_id]++;
   });
   allOpen.forEach(t => {
-    if (t.responder_id && unresCnt[t.responder_id] !== undefined)
-      unresCnt[t.responder_id]++;
+    if (t.responder_id && unresCnt[t.responder_id] !== undefined) unresCnt[t.responder_id]++;
   });
-
   return AGENT_IDS.map((id, i) => ({
-    id,
-    name:       AGENT_NAMES[i] || "Agent " + (i + 1),
-    open:       openCnt[id],
-    unresolved: unresCnt[id]
+    id, name: AGENT_NAMES[i] || "Agent " + (i + 1),
+    open: openCnt[id], unresolved: unresCnt[id]
   }));
 }
 
 async function getUnresolvedTickets() {
   const tickets = await getAllTickets("open");
   return tickets.map(t => ({
-    id:      t.id,
-    subject: t.subject || "No subject",
-    status:  t.status,
-    priority:t.priority,
-    due_by:  t.due_by,
-    agent:   t.responder_id
-      ? (AGENT_NAMES[AGENT_IDS.indexOf(t.responder_id)] || "Agent")
-      : null
+    id: t.id, subject: t.subject || "No subject",
+    status: t.status, priority: t.priority, due_by: t.due_by,
+    agent: t.responder_id
+      ? (AGENT_NAMES[AGENT_IDS.indexOf(t.responder_id)] || "Agent") : null
   }));
 }
 
-async function assignOne(ticketId, agentId) {
-  try {
-    await fdPut("tickets/" + ticketId, { responder_id: agentId });
-    return true;
-  } catch(e) {
-    const msg = e.response && e.response.data ? JSON.stringify(e.response.data) : e.message;
-    console.error("  assign failed #" + ticketId + " -> " + agentId + ": " + msg);
-    return false;
-  }
-}
-
 async function doAssignUnassigned(agentIdList) {
-  console.log("doAssignUnassigned: agentIdList=" + agentIdList);
   const all     = await getAllTickets("new_and_my_open");
   const tickets = all.filter(t => t.status === 2 && !t.responder_id);
-  console.log("  unassigned tickets found: " + tickets.length);
   if (tickets.length === 0) return { assigned: 0, failed: 0, tickets: [] };
-
   const nameMap = {};
-  agentIdList.forEach((id, i) => {
+  agentIdList.forEach(id => {
     const idx = AGENT_IDS.indexOf(Number(id));
-    nameMap[id] = AGENT_NAMES[idx] || "Agent";
+    nameMap[id] = idx >= 0 ? AGENT_NAMES[idx] : "Agent";
   });
-
   let assigned = 0, failed = 0;
   const results = [];
   for (let i = 0; i < tickets.length; i++) {
-    const t       = tickets[i];
     const agentId = agentIdList[i % agentIdList.length];
-    const ok      = await assignOne(t.id, Number(agentId));
+    const ok = await assignOne(tickets[i].id, agentId);
     if (ok) assigned++; else failed++;
-    results.push({ id: t.id, subject: t.subject || "No subject", agent: nameMap[agentId], ok });
+    results.push({ id: tickets[i].id, subject: tickets[i].subject || "No subject", agent: nameMap[agentId], ok });
   }
-  console.log("  done: assigned=" + assigned + " failed=" + failed);
   return { assigned, failed, tickets: results };
 }
 
 async function doShuffleAll(agentIdList) {
-  console.log("doShuffleAll: agentIdList=" + agentIdList);
   const all     = await getAllTickets("new_and_my_open");
   const tickets = all.filter(t => t.status === 2);
-  console.log("  open tickets found: " + tickets.length);
   if (tickets.length === 0) return { assigned: 0, failed: 0, tickets: [] };
-
   const nameMap = {};
-  agentIdList.forEach((id, i) => {
+  agentIdList.forEach(id => {
     const idx = AGENT_IDS.indexOf(Number(id));
-    nameMap[id] = AGENT_NAMES[idx] || "Agent";
+    nameMap[id] = idx >= 0 ? AGENT_NAMES[idx] : "Agent";
   });
-
   let assigned = 0, failed = 0;
   const results = [];
   for (let i = 0; i < tickets.length; i++) {
-    const t       = tickets[i];
     const agentId = agentIdList[i % agentIdList.length];
-    const ok      = await assignOne(t.id, Number(agentId));
+    const ok = await assignOne(tickets[i].id, agentId);
     if (ok) assigned++; else failed++;
-    results.push({ id: t.id, subject: t.subject || "No subject", agent: nameMap[agentId], ok });
+    results.push({ id: tickets[i].id, subject: tickets[i].subject || "No subject", agent: nameMap[agentId], ok });
   }
-  console.log("  done: assigned=" + assigned + " failed=" + failed);
   return { assigned, failed, tickets: results };
 }
 
@@ -185,13 +146,8 @@ async function doReshuffleAgent(agentId) {
   return { reassigned, total: tickets.length };
 }
 
-// ── HTML ──────────────────────────────────────────────────────────────────────
-function buildHTML() {
-  const agentsJson = JSON.stringify(
-    AGENT_IDS.map((id, i) => ({ id, name: AGENT_NAMES[i] || "Agent " + (i + 1) }))
-  );
-
-  return `<!DOCTYPE html>
+// ── HTML — fully self-contained, no template literals with injected data ──────
+const HTML_TOP = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -256,11 +212,10 @@ main{max-width:1300px;margin:0 auto;padding:24px 20px}
 .tkt-row:last-child{border-bottom:none}
 .tid{font-family:var(--fm);font-size:11px;color:var(--acc);min-width:55px;flex-shrink:0}
 .tsub{flex:1;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tag-ok{font-size:11px;font-family:var(--fm);color:var(--grn);flex-shrink:0}
-.tag-ua{font-size:11px;font-family:var(--fm);color:var(--red);flex-shrink:0}
-.tag-fail{font-size:11px;font-family:var(--fm);color:var(--red);flex-shrink:0}
+.tok{font-size:11px;font-family:var(--fm);color:var(--grn);flex-shrink:0}
+.tua{font-size:11px;font-family:var(--fm);color:var(--red);flex-shrink:0}
 .st{font-size:10px;padding:2px 7px;border-radius:20px;flex-shrink:0}
-.st-o{background:rgba(108,99,255,.15);color:var(--acc)}.st-p{background:rgba(255,209,102,.15);color:var(--yel)}.st-ov{background:rgba(255,101,132,.15);color:var(--red)}.st-h{background:rgba(255,154,60,.15);color:var(--ora)}
+.sto{background:rgba(108,99,255,.15);color:var(--acc)}.stp{background:rgba(255,209,102,.15);color:var(--yel)}.stov{background:rgba(255,101,132,.15);color:var(--red)}.sth{background:rgba(255,154,60,.15);color:var(--ora)}
 .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .d1{background:#555}.d2{background:var(--acc)}.d3{background:var(--yel)}.d4{background:var(--red)}
 .res-box{background:var(--s2);border:1px solid var(--bd);border-radius:12px;padding:16px}
@@ -274,7 +229,7 @@ main{max-width:1300px;margin:0 auto;padding:24px 20px}
 .spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
 .empty{text-align:center;padding:32px;color:var(--mut);font-size:13px}
-.err-box{background:rgba(255,101,132,.08);border:1px solid rgba(255,101,132,.3);border-radius:10px;padding:14px;font-size:12px;color:var(--red);margin-top:12px}
+.errbox{background:rgba(255,101,132,.08);border:1px solid rgba(255,101,132,.3);border-radius:10px;padding:14px;font-size:12px;color:var(--red);margin-top:12px}
 </style>
 </head>
 <body>
@@ -284,54 +239,50 @@ main{max-width:1300px;margin:0 auto;padding:24px 20px}
     <div class="live"></div>
     <div class="dom" id="dom-badge">loading...</div>
     <span class="synct" id="synct">not synced</span>
-    <button class="btn btn-gh" onclick="loadAll()" id="rfbtn">&#8635; Refresh</button>
+    <button class="btn btn-gh" id="rfbtn" onclick="loadAll()">&#8635; Refresh</button>
   </div>
 </header>
 <main>
-
 <div class="stats">
-  <div class="sc c1"><div class="sc-n" id="s-open">-</div><div class="sc-l">Open</div></div>
-  <div class="sc c2"><div class="sc-n" id="s-unassigned">-</div><div class="sc-l">Unassigned</div></div>
-  <div class="sc c3"><div class="sc-n" id="s-assigned">-</div><div class="sc-l">Assigned</div></div>
-  <div class="sc c4"><div class="sc-n" id="s-unresolved">-</div><div class="sc-l">Unresolved</div></div>
-  <div class="sc c5"><div class="sc-n" id="s-overdue">-</div><div class="sc-l">Overdue</div></div>
-  <div class="sc c6"><div class="sc-n" id="s-agents">-</div><div class="sc-l">Agents</div></div>
+  <div class="sc c1"><div class="sc-n" id="s-open">...</div><div class="sc-l">Open</div></div>
+  <div class="sc c2"><div class="sc-n" id="s-unassigned">...</div><div class="sc-l">Unassigned</div></div>
+  <div class="sc c3"><div class="sc-n" id="s-assigned">...</div><div class="sc-l">Assigned</div></div>
+  <div class="sc c4"><div class="sc-n" id="s-unresolved">...</div><div class="sc-l">Unresolved</div></div>
+  <div class="sc c5"><div class="sc-n" id="s-overdue">...</div><div class="sc-l">Overdue</div></div>
+  <div class="sc c6"><div class="sc-n" id="s-agents">14</div><div class="sc-l">Agents</div></div>
 </div>
-
 <div class="sec">
   <div class="sec-h">
     <div class="sec-t">&#9889; Step 1 &mdash; Assign Unassigned Tickets</div>
     <div class="brow">
-      <button class="btn btn-gh" onclick="sa(1)">Select All</button>
-      <button class="btn btn-gh" onclick="sn(1)">Clear</button>
+      <button class="btn btn-gh" onclick="selAll(1)">Select All</button>
+      <button class="btn btn-gh" onclick="selNone(1)">Clear</button>
       <button class="btn btn-g" id="b1" onclick="doAssign()">Assign Unassigned Equally</button>
     </div>
   </div>
   <div class="sec-b">
-    <p class="hint">Picks only unassigned open tickets and distributes them equally to selected agents. Does not touch already-assigned tickets.</p>
+    <p class="hint">Picks only unassigned open tickets and distributes equally to selected agents.</p>
     <div class="ag-grid" id="g1"></div>
     <div class="selc" id="c1"></div>
     <div id="r1" style="margin-top:16px"></div>
   </div>
 </div>
-
 <div class="sec">
   <div class="sec-h">
-    <div class="sec-t">&#128256; Step 2 &mdash; Shuffle ALL Open Tickets to Agents</div>
+    <div class="sec-t">&#128256; Step 2 &mdash; Shuffle ALL Open Tickets</div>
     <div class="brow">
-      <button class="btn btn-gh" onclick="sa(2)">Select All</button>
-      <button class="btn btn-gh" onclick="sn(2)">Clear</button>
+      <button class="btn btn-gh" onclick="selAll(2)">Select All</button>
+      <button class="btn btn-gh" onclick="selNone(2)">Clear</button>
       <button class="btn btn-o" id="b2" onclick="doShuffle()">Shuffle All to Selected</button>
     </div>
   </div>
   <div class="sec-b">
-    <p class="hint">Redistributes ALL open tickets (already assigned + unassigned) equally to selected agents. Use this after Step 1 when agents move on to unresolved work.</p>
+    <p class="hint">Redistributes ALL open tickets (assigned + unassigned) equally to selected agents.</p>
     <div class="ag-grid" id="g2"></div>
     <div class="selc" id="c2"></div>
     <div id="r2" style="margin-top:16px"></div>
   </div>
 </div>
-
 <div class="sec">
   <div class="sec-h">
     <div class="sec-t">&#128308; Unresolved Tickets</div>
@@ -346,7 +297,6 @@ main{max-width:1300px;margin:0 auto;padding:24px 20px}
   </div>
   <div class="sec-b"><div id="unres-list"><div class="empty">Loading...</div></div></div>
 </div>
-
 <div class="sec">
   <div class="sec-h">
     <div class="sec-t">&#128101; Agent Workload</div>
@@ -354,29 +304,32 @@ main{max-width:1300px;margin:0 auto;padding:24px 20px}
   </div>
   <div class="sec-b"><div class="wl-grid" id="wl-grid"><div class="empty">Loading...</div></div></div>
 </div>
-
 </main>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast"></div>`;
+
+const HTML_SCRIPT_TOP = `
 <script>
-// Agent data injected server-side
-var AGENTS = ${agentsJson};
+(function() {
 var COLS = ["#6c63ff","#ff6584","#00e5a0","#ffd166","#38bdf8","#fb923c","#a78bfa","#34d399","#f472b6","#60a5fa","#facc15","#4ade80","#f87171","#818cf8"];
-var sel1 = new Set(AGENTS.map(function(a){return a.id;}));
-var sel2 = new Set(AGENTS.map(function(a){return a.id;}));
-var allUnres = [], curFlt = 'all';
+var allUnres = [];
+var curFlt = "all";
+var sel1, sel2, AGENTS;
+`;
 
-// Show domain badge immediately from injected data
-document.getElementById('dom-badge').textContent = '${DOMAIN}';
-document.getElementById('s-agents').textContent = AGENTS.length;
+const HTML_SCRIPT_BOT = `
+sel1 = new Set(AGENTS.map(function(a){return a.id;}));
+sel2 = new Set(AGENTS.map(function(a){return a.id;}));
 
-// Build agent toggle grids
+document.getElementById("dom-badge").textContent = AGENTS.length + " agents";
+document.getElementById("s-agents").textContent  = AGENTS.length;
+
 function mkGrid(n, gid, cid) {
-  var html = '';
+  var html = "";
   AGENTS.forEach(function(a) {
-    html += '<label class="ag-tog on" id="t'+n+'-'+a.id+'" onclick="tgl('+n+','+a.id+',this)">' +
-      '<div class="chk">&#10003;</div>' +
-      '<span class="tname">'+a.name+'</span>' +
-      '</label>';
+    html += '<label class="ag-tog on" id="t'+n+'x'+a.id+'" onclick="tgl('+n+','+a.id+',this)">'
+      + '<div class="chk">&#10003;</div>'
+      + '<span class="tname">'+a.name+'</span>'
+      + '</label>';
   });
   document.getElementById(gid).innerHTML = html;
   updC(n);
@@ -384,372 +337,303 @@ function mkGrid(n, gid, cid) {
 
 function tgl(n, id, el) {
   var sel = n===1 ? sel1 : sel2;
-  if (el.classList.contains('on')) {
-    sel.delete(id); el.classList.remove('on'); el.querySelector('.chk').innerHTML = '';
+  if (el.classList.contains("on")) {
+    sel.delete(id); el.classList.remove("on"); el.querySelector(".chk").innerHTML = "";
   } else {
-    sel.add(id); el.classList.add('on'); el.querySelector('.chk').innerHTML = '&#10003;';
+    sel.add(id); el.classList.add("on"); el.querySelector(".chk").innerHTML = "&#10003;";
   }
   updC(n);
 }
 
-function sa(n) {
+function selAll(n) {
   var sel = n===1?sel1:sel2;
   AGENTS.forEach(function(a) {
     sel.add(a.id);
-    var el = document.getElementById('t'+n+'-'+a.id);
-    if (el) { el.classList.add('on'); el.querySelector('.chk').innerHTML='&#10003;'; }
+    var el = document.getElementById("t"+n+"x"+a.id);
+    if (el) { el.classList.add("on"); el.querySelector(".chk").innerHTML="&#10003;"; }
   });
   updC(n);
 }
 
-function sn(n) {
+function selNone(n) {
   var sel = n===1?sel1:sel2;
   AGENTS.forEach(function(a) {
     sel.delete(a.id);
-    var el = document.getElementById('t'+n+'-'+a.id);
-    if (el) { el.classList.remove('on'); el.querySelector('.chk').innerHTML=''; }
+    var el = document.getElementById("t"+n+"x"+a.id);
+    if (el) { el.classList.remove("on"); el.querySelector(".chk").innerHTML=""; }
   });
   updC(n);
 }
 
 function updC(n) {
   var sel = n===1?sel1:sel2;
-  var el = document.getElementById('c'+n);
-  if (el) el.textContent = sel.size+' agent'+(sel.size===1?'':'s')+' selected';
+  var el = document.getElementById("c"+n);
+  if (el) el.textContent = sel.size+" agent"+(sel.size===1?"":"s")+" selected";
 }
 
-// API helper with error logging
 async function apiFetch(path, opts) {
-  try {
-    var res = await fetch(path, opts);
-    if (!res.ok) {
-      var txt = await res.text();
-      throw new Error('HTTP '+res.status+': '+txt);
-    }
-    return await res.json();
-  } catch(e) {
-    console.error('apiFetch '+path+' failed:', e.message);
-    throw e;
-  }
+  var res = await fetch(path, opts);
+  var data = await res.json();
+  if (!res.ok) throw new Error(data.error || "HTTP "+res.status);
+  return data;
 }
 
 async function loadAll() {
-  var btn = document.getElementById('rfbtn');
+  var btn = document.getElementById("rfbtn");
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
-  try {
-    await Promise.all([loadStats(), loadAgents(), loadUnres()]);
-    document.getElementById('synct').textContent =
-      'Synced ' + new Date().toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'});
-  } catch(e) {
-    document.getElementById('synct').textContent = 'Sync failed';
-  }
-  btn.disabled = false; btn.innerHTML = '&#8635; Refresh';
+  try { await Promise.all([loadStats(), loadAgents(), loadUnres()]); }
+  catch(e) { console.error("loadAll error:", e); }
+  document.getElementById("synct").textContent =
+    "Synced " + new Date().toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata"});
+  btn.disabled = false; btn.innerHTML = "&#8635; Refresh";
 }
 
 async function loadStats() {
   try {
-    var d = await apiFetch('/api/stats');
-    document.getElementById('s-open').textContent       = d.open;
-    document.getElementById('s-unassigned').textContent = d.unassigned;
-    document.getElementById('s-assigned').textContent   = d.assigned;
-    document.getElementById('s-unresolved').textContent = d.unresolved;
-    document.getElementById('s-overdue').textContent    = d.overdue;
+    var d = await apiFetch("/api/stats");
+    document.getElementById("s-open").textContent       = d.open;
+    document.getElementById("s-unassigned").textContent = d.unassigned;
+    document.getElementById("s-assigned").textContent   = d.assigned;
+    document.getElementById("s-unresolved").textContent = d.unresolved;
+    document.getElementById("s-overdue").textContent    = d.overdue;
   } catch(e) {
-    ['s-open','s-unassigned','s-assigned','s-unresolved','s-overdue'].forEach(function(id){
-      document.getElementById(id).textContent = 'Err';
+    ["s-open","s-unassigned","s-assigned","s-unresolved","s-overdue"].forEach(function(id){
+      document.getElementById(id).textContent = "!";
     });
-    toast('Stats failed: '+e.message, 'err');
+    toast("Stats failed: "+e.message, "err");
   }
 }
 
 async function loadAgents() {
-  var g = document.getElementById('wl-grid');
+  var g = document.getElementById("wl-grid");
   try {
-    var agents = await apiFetch('/api/agents');
+    var agents = await apiFetch("/api/agents");
     var mo = 1;
     agents.forEach(function(a){ if(a.open>mo) mo=a.open; });
-    var html = '';
-    agents.forEach(function(a,i) {
-      var ini = a.name.split(' ').map(function(w){return w[0]||'';}).join('').toUpperCase().slice(0,2);
+    var html = "";
+    agents.forEach(function(a, i) {
+      var ini = a.name.split(" ").map(function(w){return w[0]||"";}).join("").toUpperCase().slice(0,2);
       var c = COLS[i%COLS.length];
       var pct = Math.round(a.open/mo*100);
-      html += '<div class="wl-card">' +
-        '<div class="av" style="background:'+c+'22;color:'+c+'">'+ini+'</div>' +
-        '<div class="wl-i">' +
-          '<div class="wl-n">'+a.name+'</div>' +
-          '<div class="wl-c"><span class="oc">'+a.open+' open</span><span class="uc">'+a.unresolved+' unresolved</span></div>' +
-          '<div class="wl-bar"><div class="wl-bf" style="width:'+pct+'%;background:'+c+'"></div></div>' +
-        '</div>' +
-        '<button class="sf-btn" onclick="doReshuffle('+a.id+',\''+a.name.replace(/'/g,"\\'")+'\')" >Shuffle</button>' +
-      '</div>';
+      html += '<div class="wl-card">'
+        + '<div class="av" style="background:'+c+'22;color:'+c+'">'+ini+'</div>'
+        + '<div class="wl-i">'
+        +   '<div class="wl-n">'+a.name+'</div>'
+        +   '<div class="wl-c"><span class="oc">'+a.open+' open</span><span class="uc">'+a.unresolved+' unresolved</span></div>'
+        +   '<div class="wl-bar"><div class="wl-bf" style="width:'+pct+'%;background:'+c+'"></div></div>'
+        + '</div>'
+        + '<button class="sf-btn" onclick="doReshuffle('+a.id+')">Shuffle</button>'
+        + '</div>';
     });
     g.innerHTML = html;
   } catch(e) {
-    g.innerHTML = '<div class="err-box">Failed to load agents: '+e.message+'</div>';
+    g.innerHTML = '<div class="errbox">Failed: '+e.message+'</div>';
   }
 }
 
 async function loadUnres() {
   try {
-    allUnres = await apiFetch('/api/unresolved');
+    allUnres = await apiFetch("/api/unresolved");
     renderUnres();
   } catch(e) {
-    document.getElementById('unres-list').innerHTML =
-      '<div class="err-box">Failed to load: '+e.message+'</div>';
+    document.getElementById("unres-list").innerHTML = '<div class="errbox">Failed: '+e.message+'</div>';
   }
 }
 
 function flt(f, el) {
   curFlt = f;
-  document.querySelectorAll('#utabs .tab').forEach(function(t){t.classList.remove('active');});
-  el.classList.add('active');
+  document.querySelectorAll("#utabs .tab").forEach(function(t){t.classList.remove("active");});
+  el.classList.add("active");
   renderUnres();
 }
 
 function renderUnres() {
   var now = new Date();
   var list = allUnres.slice();
-  if (curFlt==='unassigned') list = list.filter(function(t){return !t.agent;});
-  if (curFlt==='overdue')    list = list.filter(function(t){return t.due_by && new Date(t.due_by)<now;});
-  if (list.length===0) {
-    document.getElementById('unres-list').innerHTML = '<div class="empty">No tickets &#10003;</div>';
-    return;
-  }
-  var slbl = {2:'open',3:'pending',6:'on hold'};
-  var scls = {2:'st-o',3:'st-p',6:'st-h'};
-  var pcls = {1:'d1',2:'d2',3:'d3',4:'d4'};
-  var rows = '';
+  if (curFlt==="unassigned") list = list.filter(function(t){return !t.agent;});
+  if (curFlt==="overdue")    list = list.filter(function(t){return t.due_by && new Date(t.due_by)<now;});
+  if (list.length===0) { document.getElementById("unres-list").innerHTML='<div class="empty">No tickets &#10003;</div>'; return; }
+  var slbl = {2:"open",3:"pending",6:"on hold"};
+  var scls = {2:"sto",3:"stp",6:"sth"};
+  var pcls = {1:"d1",2:"d2",3:"d3",4:"d4"};
+  var rows = "";
   list.slice(0,100).forEach(function(t) {
-    var ov     = t.due_by && new Date(t.due_by)<now;
-    var stCls  = ov ? 'st-ov' : (scls[t.status]||'st-o');
-    var stLbl  = ov ? 'overdue' : (slbl[t.status]||'open');
-    var agHtml = t.agent
-      ? '<span class="tag-ok">'+t.agent+'</span>'
-      : '<span class="tag-ua">unassigned</span>';
-    rows += '<div class="tkt-row">' +
-      '<div class="dot '+(pcls[t.priority]||'d1')+'"></div>' +
-      '<span class="tid">#'+t.id+'</span>' +
-      '<span class="tsub">'+t.subject+'</span>' +
-      '<span class="st '+stCls+'">'+stLbl+'</span>' +
-      agHtml+
-    '</div>';
+    var ov    = t.due_by && new Date(t.due_by)<now;
+    var stC   = ov?"stov":(scls[t.status]||"sto");
+    var stL   = ov?"overdue":(slbl[t.status]||"open");
+    var agH   = t.agent ? '<span class="tok">'+t.agent+'</span>' : '<span class="tua">unassigned</span>';
+    rows += '<div class="tkt-row">'
+      + '<div class="dot '+(pcls[t.priority]||"d1")+'"></div>'
+      + '<span class="tid">#'+t.id+'</span>'
+      + '<span class="tsub">'+t.subject+'</span>'
+      + '<span class="st '+stC+'">'+stL+'</span>'
+      + agH+'</div>';
   });
-  var more = list.length>100
-    ? '<div style="padding:8px 0;color:var(--mut);font-size:11px">...and '+(list.length-100)+' more</div>'
-    : '';
-  document.getElementById('unres-list').innerHTML =
-    '<div style="font-size:11px;color:var(--mut);margin-bottom:10px">'+
-      Math.min(list.length,100)+' of '+list.length+' tickets'+
-    '</div>'+
-    '<div class="tkt-list">'+rows+'</div>'+more;
+  var more = list.length>100 ? '<div style="padding:8px 0;color:var(--mut);font-size:11px">...and '+(list.length-100)+' more</div>' : "";
+  document.getElementById("unres-list").innerHTML =
+    '<div style="font-size:11px;color:var(--mut);margin-bottom:10px">'+Math.min(list.length,100)+' of '+list.length+' tickets</div>'
+    +'<div class="tkt-list">'+rows+'</div>'+more;
 }
 
 async function doAssign() {
-  if (sel1.size===0) { toast('Select at least 1 agent!','err'); return; }
-  var btn = document.getElementById('b1');
+  if (sel1.size===0) { toast("Select at least 1 agent!","err"); return; }
+  var btn = document.getElementById("b1");
   btn.disabled=true; btn.innerHTML='<span class="spin"></span> Assigning...';
   try {
-    var d = await apiFetch('/api/assign-unassigned',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({agentIds:[...sel1]})
-    });
-    showRes('r1', d);
-    await loadAll();
-  } catch(e) {
-    document.getElementById('r1').innerHTML='<div class="err-box">Failed: '+e.message+'</div>';
-    toast('Assignment failed','err');
-  }
-  btn.disabled=false; btn.innerHTML='Assign Unassigned Equally';
+    var d = await apiFetch("/api/assign-unassigned",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentIds:[...sel1]})});
+    showRes("r1", d); await loadAll();
+  } catch(e) { document.getElementById("r1").innerHTML='<div class="errbox">Failed: '+e.message+'</div>'; toast("Failed","err"); }
+  btn.disabled=false; btn.innerHTML="Assign Unassigned Equally";
 }
 
 async function doShuffle() {
-  if (sel2.size===0) { toast('Select at least 1 agent!','err'); return; }
-  var total = document.getElementById('s-open').textContent;
-  if (!confirm('Reassign ALL '+total+' open tickets to '+sel2.size+' agents? This cannot be undone.')) return;
-  var btn = document.getElementById('b2');
+  if (sel2.size===0) { toast("Select at least 1 agent!","err"); return; }
+  var total = document.getElementById("s-open").textContent;
+  if (!confirm("Reassign ALL "+total+" open tickets to "+sel2.size+" agents?")) return;
+  var btn = document.getElementById("b2");
   btn.disabled=true; btn.innerHTML='<span class="spin"></span> Shuffling...';
   try {
-    var d = await apiFetch('/api/shuffle-all',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({agentIds:[...sel2]})
-    });
-    showRes('r2', d);
-    await loadAll();
-  } catch(e) {
-    document.getElementById('r2').innerHTML='<div class="err-box">Failed: '+e.message+'</div>';
-    toast('Shuffle failed','err');
-  }
-  btn.disabled=false; btn.innerHTML='Shuffle All to Selected';
+    var d = await apiFetch("/api/shuffle-all",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentIds:[...sel2]})});
+    showRes("r2", d); await loadAll();
+  } catch(e) { document.getElementById("r2").innerHTML='<div class="errbox">Failed: '+e.message+'</div>'; toast("Failed","err"); }
+  btn.disabled=false; btn.innerHTML="Shuffle All to Selected";
 }
 
-async function doReshuffle(agentId, agentName) {
-  if (!confirm("Move all of "+agentName+"'s tickets to other agents?")) return;
-  toast('Reshuffling '+agentName+'...');
+async function doReshuffle(agentId) {
+  var agent = AGENTS.find(function(a){return a.id===agentId;});
+  var name  = agent ? agent.name : "Agent";
+  if (!confirm("Move all of "+name+"'s tickets to other agents?")) return;
+  toast("Reshuffling "+name+"...");
   try {
-    var d = await apiFetch('/api/reshuffle',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({agentId:agentId})
-    });
-    toast('Moved '+d.reassigned+' tickets from '+agentName,'ok');
+    var d = await apiFetch("/api/reshuffle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentId:agentId})});
+    toast("Moved "+d.reassigned+" tickets from "+name,"ok");
     await loadAll();
-  } catch(e) { toast('Reshuffle failed: '+e.message,'err'); }
+  } catch(e) { toast("Failed: "+e.message,"err"); }
 }
 
 function showRes(elId, data) {
-  if (data.assigned===0) {
-    document.getElementById(elId).innerHTML='<div class="empty">&#10003; No unassigned tickets found!</div>';
-    toast('Nothing to assign','ok');
-    return;
-  }
-  var rows = '';
+  if (data.assigned===0) { document.getElementById(elId).innerHTML='<div class="empty">&#10003; Nothing to assign!</div>'; toast("Nothing to assign","ok"); return; }
+  var rows = "";
   (data.tickets||[]).slice(0,60).forEach(function(t){
-    rows += '<div class="tkt-row">' +
-      '<span class="tid">#'+t.id+'</span>' +
-      '<span class="tsub">'+t.subject+'</span>' +
-      (t.ok
-        ? '<span class="tag-ok">&rarr; '+t.agent+'</span>'
-        : '<span class="tag-fail">failed</span>') +
-    '</div>';
+    rows += '<div class="tkt-row"><span class="tid">#'+t.id+'</span><span class="tsub">'+t.subject+'</span>'
+      +(t.ok?'<span class="tok">'+t.agent+'</span>':'<span class="tua">failed</span>')+'</div>';
   });
-  var more = data.tickets.length>60
-    ? '<div style="padding:8px 0;color:var(--mut);font-size:11px">...and '+(data.tickets.length-60)+' more</div>'
-    : '';
+  var more = data.tickets.length>60 ? '<div style="padding:8px 0;color:var(--mut);font-size:11px">...and '+(data.tickets.length-60)+' more</div>' : "";
   document.getElementById(elId).innerHTML =
-    '<div class="res-box">' +
-      '<div class="res-sum">' +
-        '<span class="rok">&#10003; '+data.assigned+' assigned</span>' +
-        (data.failed>0?'<span class="rfail">&#10007; '+data.failed+' failed</span>':'')+
-      '</div>' +
-      '<div class="tkt-list">'+rows+'</div>'+more+
-    '</div>';
-  toast(data.assigned+' tickets assigned!','ok');
+    '<div class="res-box"><div class="res-sum"><span class="rok">&#10003; '+data.assigned+' assigned</span>'
+    +(data.failed>0?'<span class="rfail">&#10007; '+data.failed+' failed</span>':'')
+    +'</div><div class="tkt-list">'+rows+'</div>'+more+'</div>';
+  toast(data.assigned+" tickets assigned!","ok");
 }
 
 function toast(msg, type) {
-  var t = document.getElementById('toast');
+  var t = document.getElementById("toast");
   t.textContent = msg;
-  t.className = 'toast show'+(type?' '+type:'');
+  t.className = "toast show"+(type?" "+type:"");
   clearTimeout(window._tt);
-  window._tt = setTimeout(function(){ t.className='toast'; }, 3500);
+  window._tt = setTimeout(function(){t.className="toast";}, 3500);
 }
 
-// Init grids and load data
-mkGrid(1,'g1','c1');
-mkGrid(2,'g2','c2');
+mkGrid(1,"g1","c1");
+mkGrid(2,"g2","c2");
 loadAll();
 setInterval(loadAll, 90000);
+})();
 </script>
-</body>
-</html>`;
+</body></html>`;
+
+function buildHTML(agentsJson) {
+  // Inject agents as a JS assignment — completely safe, no template literal issues
+  var agentScript = '\nAGENTS = ' + agentsJson + ';\n';
+  return HTML_TOP + HTML_SCRIPT_TOP + agentScript + HTML_SCRIPT_BOT;
 }
 
 // ── HTTP SERVER ───────────────────────────────────────────────────────────────
 const server = http.createServer(async function(req, res) {
   const p = url.parse(req.url).pathname;
+  console.log(req.method + " " + p);
 
   function sendJSON(code, data) {
-    res.writeHead(code, {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*"
-    });
+    res.writeHead(code, {"Content-Type":"application/json","Access-Control-Allow-Origin":"*"});
     res.end(JSON.stringify(data));
   }
 
-  function sendHTML(code, html) {
-    res.writeHead(code, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(html);
-  }
-
-  // Log every request for debugging
-  console.log(req.method + " " + p);
-
   if (p === "/" || p === "/dashboard") {
-    sendHTML(200, buildHTML());
+    const agentsJson = JSON.stringify(AGENT_IDS.map(function(id, i) {
+      return { id: id, name: AGENT_NAMES[i] || "Agent " + (i+1) };
+    }));
+    res.writeHead(200, {"Content-Type":"text/html; charset=utf-8"});
+    res.end(buildHTML(agentsJson));
     return;
   }
 
   if (p === "/api/stats") {
     try { sendJSON(200, await getStats()); }
-    catch(e) { console.error("/api/stats error:", e.message); sendJSON(500, { error: e.message }); }
+    catch(e) { console.error("/api/stats:", e.message); sendJSON(500, {error:e.message}); }
     return;
   }
 
   if (p === "/api/agents") {
     try { sendJSON(200, await getAgentWorkload()); }
-    catch(e) { console.error("/api/agents error:", e.message); sendJSON(500, { error: e.message }); }
+    catch(e) { console.error("/api/agents:", e.message); sendJSON(500, {error:e.message}); }
     return;
   }
 
   if (p === "/api/unresolved") {
     try { sendJSON(200, await getUnresolvedTickets()); }
-    catch(e) { console.error("/api/unresolved error:", e.message); sendJSON(500, { error: e.message }); }
+    catch(e) { console.error("/api/unresolved:", e.message); sendJSON(500, {error:e.message}); }
     return;
   }
 
   if (req.method === "POST") {
     var body = await new Promise(function(resolve, reject) {
       var b = "";
-      req.on("data", function(c) { b += c; });
-      req.on("end", function() {
+      req.on("data", function(c){b+=c;});
+      req.on("end", function(){
         try { resolve(JSON.parse(b)); }
-        catch(e) { reject(e); }
+        catch(e) { reject(new Error("Invalid JSON body")); }
       });
     });
 
     if (p === "/api/assign-unassigned") {
       try { sendJSON(200, await doAssignUnassigned(body.agentIds)); }
-      catch(e) { console.error("/api/assign-unassigned error:", e.message); sendJSON(500, { error: e.message }); }
+      catch(e) { console.error("/api/assign-unassigned:", e.message); sendJSON(500, {error:e.message}); }
       return;
     }
-
     if (p === "/api/shuffle-all") {
       try { sendJSON(200, await doShuffleAll(body.agentIds)); }
-      catch(e) { console.error("/api/shuffle-all error:", e.message); sendJSON(500, { error: e.message }); }
+      catch(e) { console.error("/api/shuffle-all:", e.message); sendJSON(500, {error:e.message}); }
       return;
     }
-
     if (p === "/api/reshuffle") {
       try { sendJSON(200, await doReshuffleAgent(body.agentId)); }
-      catch(e) { console.error("/api/reshuffle error:", e.message); sendJSON(500, { error: e.message }); }
+      catch(e) { console.error("/api/reshuffle:", e.message); sendJSON(500, {error:e.message}); }
       return;
     }
   }
 
-  sendJSON(404, { error: "not found" });
+  sendJSON(404, {error:"not found"});
 });
 
 server.listen(PORT, function() {
   console.log("========================================");
   console.log("TrustVA Ticket Desk running on port " + PORT);
-  console.log("Open your Railway URL in the browser!");
   console.log("========================================");
 });
 
-server.on('error', function(e) {
-  console.error("Server error:", e.message);
-});
+server.on("error", function(e) { console.error("Server error:", e.message); });
 
 // ── CRON ─────────────────────────────────────────────────────────────────────
 cron.schedule("0 4 * * 1-6", function() {
-  console.log("9:30am cron running...");
-  doAssignUnassigned(AGENT_IDS).then(function(r) {
-    console.log("9:30am cron done: " + r.assigned + " assigned");
-  }).catch(function(e) {
-    console.error("9:30am cron failed:", e.message);
-  });
+  doAssignUnassigned(AGENT_IDS).then(function(r){ console.log("9:30am cron: "+r.assigned+" assigned"); })
+  .catch(function(e){ console.error("cron error:", e.message); });
 }, { timezone: "Asia/Kolkata" });
 
 cron.schedule("*/30 3-14 * * 1-6", async function() {
   try {
     var all = await getAllTickets("new_and_my_open");
-    var u = all.filter(function(t){ return t.status===2 && !t.responder_id; });
-    console.log("Surge check: " + u.length + " unassigned");
-    if (u.length >= 20) {
-      console.log("Surge! Auto-assigning...");
-      await doAssignUnassigned(AGENT_IDS);
-    }
-  } catch(e) { console.error("Surge check error:", e.message); }
+    var u = all.filter(function(t){return t.status===2&&!t.responder_id;});
+    if (u.length>=20) { console.log("Surge "+u.length+" — auto assigning"); await doAssignUnassigned(AGENT_IDS); }
+    else console.log("Surge check ok: "+u.length+" unassigned");
+  } catch(e) { console.error("surge check error:", e.message); }
 }, { timezone: "Asia/Kolkata" });
