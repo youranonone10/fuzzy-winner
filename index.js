@@ -309,7 +309,7 @@ main{max-width:1300px;margin:0 auto;padding:24px 20px}
 
 const HTML_SCRIPT_TOP = `
 <script>
-(function() {
+
 var COLS = ["#6c63ff","#ff6584","#00e5a0","#ffd166","#38bdf8","#fb923c","#a78bfa","#34d399","#f472b6","#60a5fa","#facc15","#4ade80","#f87171","#818cf8"];
 var allUnres = [];
 var curFlt = "all";
@@ -538,7 +538,7 @@ mkGrid(1,"g1","c1");
 mkGrid(2,"g2","c2");
 loadAll();
 setInterval(loadAll, 90000);
-})();
+
 </script>
 </body></html>`;
 
