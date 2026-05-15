@@ -3,26 +3,27 @@ const axios = require("axios");
 const http  = require("http");
 const url   = require("url");
 
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
 const DOMAIN      = process.env.FRESHDESK_DOMAIN;
 const API_KEY     = process.env.FRESHDESK_API_KEY;
-const AGENT_IDS   = process.env.AGENT_IDS.split(",").map(Number);
-const AGENT_NAMES = process.env.AGENT_NAMES.split(",").map(s => s.trim());
+const AGENT_IDS   = (process.env.AGENT_IDS || "").split(",").map(s => parseInt(s.trim())).filter(Boolean);
+const AGENT_NAMES = (process.env.AGENT_NAMES || "").split(",").map(s => s.trim()).filter(Boolean);
 const PORT        = process.env.PORT || 3000;
 const auth        = { username: API_KEY, password: "X" };
 
-console.log("ENV CHECK:");
-console.log("  DOMAIN      = " + DOMAIN);
-console.log("  API_KEY     = " + (API_KEY ? API_KEY.slice(0,6)+"..." : "MISSING!"));
-console.log("  AGENT_IDS   = " + AGENT_IDS.length + " agents");
-console.log("  PORT        = " + PORT);
+// Startup validation
+if (!DOMAIN || !API_KEY || !AGENT_IDS.length) {
+  console.error("❌ Missing env vars! Need: FRESHDESK_DOMAIN, FRESHDESK_API_KEY, AGENT_IDS, AGENT_NAMES");
+}
+console.log("✅ Config loaded:", { DOMAIN, AGENT_IDS, AGENT_NAMES });
 
-// ── FRESHDESK API ─────────────────────────────────────────────────────────────
-async function getAllTickets(filter) {
+// ─── FRESHDESK HELPERS ────────────────────────────────────────────────────────
+async function fetchAllPages(filter) {
   let page = 1, all = [];
   while (true) {
     const res = await axios.get(
-      "https://" + DOMAIN + "/api/v2/tickets?filter=" + filter + "&per_page=100&page=" + page,
-      { auth, timeout: 15000 }
+      `https://${DOMAIN}/api/v2/tickets?filter=${filter}&per_page=100&page=${page}`,
+      { auth }
     );
     all = all.concat(res.data);
     if (res.data.length < 100) break;
@@ -32,608 +33,632 @@ async function getAllTickets(filter) {
   return all;
 }
 
-async function assignOne(ticketId, agentId) {
+async function getStats() {
+  const all = await fetchAllPages("new_and_my_open");
+
+  const open       = all.filter(t => t.status === 2);
+  const pending    = all.filter(t => t.status === 3);
+  const unassigned = open.filter(t => !t.responder_id);
+  const assigned   = open.filter(t => !!t.responder_id);
+  const overdue    = all.filter(t => t.due_by && new Date(t.due_by) < new Date() && t.status < 4);
+  const unresolved = all.filter(t => t.status < 4);
+
+  return {
+    open: open.length,
+    unassigned: unassigned.length,
+    assigned: assigned.length,
+    pending: pending.length,
+    overdue: overdue.length,
+    unresolved: unresolved.length,
+    unresolvedTickets: unresolved.slice(0, 200).map(t => ({
+      id: t.id,
+      subject: t.subject || "No subject",
+      status: t.status,
+      priority: t.priority,
+      responder_id: t.responder_id,
+      due_by: t.due_by,
+      created_at: t.created_at
+    })),
+    unassignedTickets: unassigned.slice(0, 200).map(t => ({
+      id: t.id, subject: t.subject || "No subject", priority: t.priority, created_at: t.created_at
+    }))
+  };
+}
+
+async function getAgentCounts() {
+  const all = await fetchAllPages("new_and_my_open");
+  const open = all.filter(t => t.status === 2);
+  return AGENT_IDS.map((id, i) => ({
+    id,
+    name: AGENT_NAMES[i] || "Agent " + (i + 1),
+    count: open.filter(t => t.responder_id === id).length,
+    unresolved: all.filter(t => t.responder_id === id && t.status < 4).length
+  }));
+}
+
+async function assignTicket(ticketId, agentId) {
   try {
     await axios.put(
-      "https://" + DOMAIN + "/api/v2/tickets/" + ticketId,
-      { responder_id: Number(agentId) },
-      { auth, headers: { "Content-Type": "application/json" }, timeout: 15000 }
+      `https://${DOMAIN}/api/v2/tickets/${ticketId}`,
+      { responder_id: agentId },
+      { auth, headers: { "Content-Type": "application/json" } }
     );
     return true;
-  } catch(e) {
-    const msg = e.response && e.response.data ? JSON.stringify(e.response.data) : e.message;
-    console.error("  assign failed #" + ticketId + ": " + msg);
+  } catch (err) {
+    console.error(`Failed #${ticketId}:`, err.response?.data || err.message);
     return false;
   }
 }
 
-// ── DATA FUNCTIONS ────────────────────────────────────────────────────────────
-async function getStats() {
-  const [newOpen, allOpen] = await Promise.all([
-    getAllTickets("new_and_my_open"),
-    getAllTickets("open")
-  ]);
-  const open       = newOpen.filter(t => t.status === 2);
-  const unassigned = open.filter(t => !t.responder_id);
-  const now        = new Date();
-  const overdue    = allOpen.filter(t => t.due_by && new Date(t.due_by) < now);
-  return {
-    open:       open.length,
-    unassigned: unassigned.length,
-    assigned:   open.length - unassigned.length,
-    unresolved: allOpen.length,
-    overdue:    overdue.length
-  };
-}
+async function runUnassignedOnly(agentIdList) {
+  agentIdList = agentIdList || AGENT_IDS;
+  const all = await fetchAllPages("new_and_my_open");
+  const unassigned = all.filter(t => t.status === 2 && !t.responder_id);
+  if (!unassigned.length) return { assigned: 0, failed: 0, tickets: [], perAgent: {} };
 
-async function getAgentWorkload() {
-  const [newOpen, allOpen] = await Promise.all([
-    getAllTickets("new_and_my_open"),
-    getAllTickets("open")
-  ]);
-  const openCnt = {}, unresCnt = {};
-  AGENT_IDS.forEach(id => { openCnt[id] = 0; unresCnt[id] = 0; });
-  newOpen.filter(t => t.status === 2).forEach(t => {
-    if (t.responder_id && openCnt[t.responder_id] !== undefined) openCnt[t.responder_id]++;
-  });
-  allOpen.forEach(t => {
-    if (t.responder_id && unresCnt[t.responder_id] !== undefined) unresCnt[t.responder_id]++;
-  });
-  return AGENT_IDS.map((id, i) => ({
-    id, name: AGENT_NAMES[i] || "Agent " + (i + 1),
-    open: openCnt[id], unresolved: unresCnt[id]
-  }));
-}
-
-async function getUnresolvedTickets() {
-  const tickets = await getAllTickets("open");
-  return tickets.map(t => ({
-    id: t.id, subject: t.subject || "No subject",
-    status: t.status, priority: t.priority, due_by: t.due_by,
-    agent: t.responder_id
-      ? (AGENT_NAMES[AGENT_IDS.indexOf(t.responder_id)] || "Agent") : null
-  }));
-}
-
-async function doAssignUnassigned(agentIdList) {
-  const all     = await getAllTickets("new_and_my_open");
-  const tickets = all.filter(t => t.status === 2 && !t.responder_id);
-  if (tickets.length === 0) return { assigned: 0, failed: 0, tickets: [] };
-  const nameMap = {};
-  agentIdList.forEach(id => {
-    const idx = AGENT_IDS.indexOf(Number(id));
-    nameMap[id] = idx >= 0 ? AGENT_NAMES[idx] : "Agent";
-  });
   let assigned = 0, failed = 0;
-  const results = [];
-  for (let i = 0; i < tickets.length; i++) {
-    const agentId = agentIdList[i % agentIdList.length];
-    const ok = await assignOne(tickets[i].id, agentId);
-    if (ok) assigned++; else failed++;
-    results.push({ id: tickets[i].id, subject: tickets[i].subject || "No subject", agent: nameMap[agentId], ok });
-  }
-  return { assigned, failed, tickets: results };
-}
-
-async function doShuffleAll(agentIdList) {
-  const all     = await getAllTickets("new_and_my_open");
-  const tickets = all.filter(t => t.status === 2);
-  if (tickets.length === 0) return { assigned: 0, failed: 0, tickets: [] };
-  const nameMap = {};
-  agentIdList.forEach(id => {
-    const idx = AGENT_IDS.indexOf(Number(id));
-    nameMap[id] = idx >= 0 ? AGENT_NAMES[idx] : "Agent";
+  const perAgent = {};
+  agentIdList.forEach((id, i) => {
+    const idx = AGENT_IDS.indexOf(id);
+    perAgent[id] = { name: AGENT_NAMES[idx] || "Agent " + (i + 1), count: 0 };
   });
-  let assigned = 0, failed = 0;
   const results = [];
-  for (let i = 0; i < tickets.length; i++) {
+
+  for (let i = 0; i < unassigned.length; i++) {
+    const ticket  = unassigned[i];
     const agentId = agentIdList[i % agentIdList.length];
-    const ok = await assignOne(tickets[i].id, agentId);
-    if (ok) assigned++; else failed++;
-    results.push({ id: tickets[i].id, subject: tickets[i].subject || "No subject", agent: nameMap[agentId], ok });
+    const ok = await assignTicket(ticket.id, agentId);
+    if (ok) { perAgent[agentId].count++; assigned++; }
+    else failed++;
+    results.push({ id: ticket.id, subject: ticket.subject || "No subject", agent: perAgent[agentId]?.name, type: "unassigned", ok });
   }
-  return { assigned, failed, tickets: results };
+  return { assigned, failed, perAgent, tickets: results };
 }
 
-async function doReshuffleAgent(agentId) {
-  const all     = await getAllTickets("new_and_my_open");
-  const tickets = all.filter(t => t.status === 2 && t.responder_id === Number(agentId));
-  const others  = AGENT_IDS.filter(id => id !== Number(agentId));
+async function runFullAssignment(agentIdList) {
+  agentIdList = agentIdList || AGENT_IDS;
+  const all = await fetchAllPages("new_and_my_open");
+
+  const unassigned = all.filter(t => t.status === 2 && !t.responder_id);
+  const unresolved = all.filter(t => t.status < 4 && !!t.responder_id);
+  const toAssign = [...unassigned, ...unresolved];
+
+  if (!toAssign.length) return { assigned: 0, failed: 0, tickets: [], perAgent: {} };
+
+  let assigned = 0, failed = 0;
+  const perAgent = {};
+  agentIdList.forEach((id, i) => {
+    const idx = AGENT_IDS.indexOf(id);
+    perAgent[id] = { name: AGENT_NAMES[idx] || "Agent " + (i + 1), count: 0 };
+  });
+  const results = [];
+
+  for (let i = 0; i < toAssign.length; i++) {
+    const ticket  = toAssign[i];
+    const agentId = agentIdList[i % agentIdList.length];
+    const ok = await assignTicket(ticket.id, agentId);
+    if (ok) { perAgent[agentId].count++; assigned++; }
+    else failed++;
+    results.push({ id: ticket.id, subject: ticket.subject || "No subject", agent: perAgent[agentId]?.name, type: !ticket.responder_id ? "unassigned" : "unresolved", ok });
+  }
+  return { assigned, failed, perAgent, tickets: results };
+}
+
+async function reshuffleAgent(agentId) {
+  const all = await fetchAllPages("new_and_my_open");
+  const tickets = all.filter(t => t.responder_id === agentId && t.status < 4);
+  const otherAgents = AGENT_IDS.filter(id => id !== agentId);
+  if (!otherAgents.length) return { reassigned: 0, total: tickets.length };
   let reassigned = 0;
   for (let i = 0; i < tickets.length; i++) {
-    if (await assignOne(tickets[i].id, others[i % others.length])) reassigned++;
+    const ok = await assignTicket(tickets[i].id, otherAgents[i % otherAgents.length]);
+    if (ok) reassigned++;
   }
   return { reassigned, total: tickets.length };
 }
 
-// ── HTML — fully self-contained, no template literals with injected data ──────
-const HTML_TOP = `<!DOCTYPE html>
+// ─── HTML DASHBOARD ───────────────────────────────────────────────────────────
+const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TrustVA Ticket Desk</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<title>TrustVA · Ticket Desk</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#08080e;--s1:#101018;--s2:#181825;--bd:#252535;--acc:#6c63ff;--red:#ff6584;--grn:#00e5a0;--yel:#ffd166;--ora:#ff9a3c;--txt:#e4e4f0;--mut:#5a5a72;--fh:'Syne',sans-serif;--fb:'DM Sans',sans-serif;--fm:'DM Mono',monospace}
-body{background:var(--bg);color:var(--txt);font-family:var(--fb);min-height:100vh}
-header{position:sticky;top:0;z-index:100;padding:0 24px;height:52px;display:flex;align-items:center;justify-content:space-between;background:rgba(8,8,14,.95);backdrop-filter:blur(16px);border-bottom:1px solid var(--bd)}
-.logo{font-family:var(--fh);font-size:17px;font-weight:800}.logo span{color:var(--acc)}
-.hr{display:flex;align-items:center;gap:10px}
-.live{width:7px;height:7px;border-radius:50%;background:var(--grn);box-shadow:0 0 8px var(--grn);animation:blink 2s infinite}
+:root{
+  --bg:#080810;--surface:#10101a;--surface2:#181825;--border:#252535;
+  --accent:#6c63ff;--accent2:#ff6584;--green:#00e5a0;--yellow:#ffd166;--orange:#ff9f43;
+  --text:#e8e8f4;--muted:#5a5a72;
+  --fh:'Syne',sans-serif;--fb:'DM Sans',sans-serif;--fm:'DM Mono',monospace;
+}
+body{background:var(--bg);color:var(--text);font-family:var(--fb);min-height:100vh}
+body::before{content:'';position:fixed;top:-300px;right:-200px;width:700px;height:700px;background:radial-gradient(circle,rgba(108,99,255,0.07) 0%,transparent 65%);pointer-events:none}
+body::after{content:'';position:fixed;bottom:-200px;left:-100px;width:500px;height:500px;background:radial-gradient(circle,rgba(255,101,132,0.05) 0%,transparent 65%);pointer-events:none}
+
+header{position:sticky;top:0;z-index:100;padding:16px 32px;border-bottom:1px solid var(--border);background:rgba(8,8,16,0.9);backdrop-filter:blur(16px);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.logo{font-family:var(--fh);font-size:18px;font-weight:800;letter-spacing:-0.5px}
+.logo span{color:var(--accent)}
+.hright{display:flex;align-items:center;gap:10px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:blink 2s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-.dom{font-family:var(--fm);font-size:11px;color:var(--mut);background:var(--s2);padding:3px 10px;border-radius:20px;border:1px solid var(--bd)}
-.synct{font-size:11px;color:var(--mut)}
-main{max-width:1300px;margin:0 auto;padding:24px 20px}
-.stats{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:24px}
-@media(max-width:900px){.stats{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:500px){.stats{grid-template-columns:repeat(2,1fr)}}
-.sc{background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;transition:border-color .2s}
-.sc:hover{border-color:rgba(108,99,255,.4)}
-.sc::after{content:'';position:absolute;top:0;left:0;right:0;height:2px}
-.sc.c1::after{background:var(--acc)}.sc.c2::after{background:var(--red)}.sc.c3::after{background:var(--grn)}.sc.c4::after{background:var(--yel)}.sc.c5::after{background:var(--ora)}.sc.c6::after{background:#38bdf8}
-.sc-n{font-family:var(--fh);font-size:30px;font-weight:800;line-height:1;margin-bottom:4px}
-.sc-l{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.08em;font-weight:500}
-.sec{background:var(--s1);border:1px solid var(--bd);border-radius:18px;margin-bottom:20px;overflow:hidden}
-.sec-h{padding:16px 22px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-.sec-t{font-family:var(--fh);font-size:14px;font-weight:700}
-.sec-b{padding:20px 22px}
-.hint{font-size:12px;color:var(--mut);margin-bottom:14px;line-height:1.6}
-.btn{display:inline-flex;align-items:center;gap:5px;padding:8px 16px;border-radius:9px;font-size:12px;font-weight:600;font-family:var(--fb);cursor:pointer;border:none;transition:all .15s;white-space:nowrap}
-.btn-g{background:var(--grn);color:#000}.btn-g:hover{opacity:.85;transform:translateY(-1px)}
-.btn-o{background:transparent;border:1px solid var(--ora);color:var(--ora)}.btn-o:hover{background:rgba(255,154,60,.1)}
-.btn-gh{background:transparent;border:1px solid var(--bd);color:var(--txt)}.btn-gh:hover{border-color:var(--acc);color:var(--acc)}
-.btn:disabled{opacity:.35;cursor:not-allowed;transform:none!important}
-.brow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.ag-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:7px;margin-bottom:10px}
-.ag-tog{display:flex;align-items:center;gap:7px;padding:9px 12px;border-radius:9px;border:1px solid var(--bd);background:var(--s2);cursor:pointer;transition:all .15s;user-select:none}
-.ag-tog.on{border-color:var(--acc);background:rgba(108,99,255,.1)}
-.chk{width:15px;height:15px;border-radius:4px;border:1px solid var(--bd);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:9px;transition:all .15s}
-.ag-tog.on .chk{background:var(--acc);border-color:var(--acc);color:#fff}
-.tname{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.selc{font-size:11px;color:var(--mut);margin-top:4px}
-.wl-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
-.wl-card{background:var(--s2);border:1px solid var(--bd);border-radius:12px;padding:14px 16px;display:flex;align-items:center;gap:12px;transition:all .2s}
-.wl-card:hover{border-color:var(--acc);transform:translateY(-1px)}
-.av{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-family:var(--fh);font-size:12px;font-weight:700;flex-shrink:0}
-.wl-i{flex:1;min-width:0}
-.wl-n{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
-.wl-c{display:flex;gap:10px;font-size:11px;font-family:var(--fm);margin-bottom:5px}
-.oc{color:var(--acc)}.uc{color:var(--yel)}
-.wl-bar{height:3px;background:var(--bd);border-radius:2px;overflow:hidden}
-.wl-bf{height:100%;border-radius:2px;transition:width .6s}
-.sf-btn{padding:5px 9px;font-size:11px;border-radius:7px;border:1px solid var(--bd);background:transparent;color:var(--mut);cursor:pointer;transition:all .15s;font-family:var(--fb)}
-.sf-btn:hover{border-color:var(--red);color:var(--red)}
-.tkt-list{max-height:340px;overflow-y:auto}
-.tkt-list::-webkit-scrollbar{width:3px}
-.tkt-list::-webkit-scrollbar-thumb{background:var(--bd);border-radius:2px}
-.tkt-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--bd);font-size:12px}
-.tkt-row:last-child{border-bottom:none}
-.tid{font-family:var(--fm);font-size:11px;color:var(--acc);min-width:55px;flex-shrink:0}
-.tsub{flex:1;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tok{font-size:11px;font-family:var(--fm);color:var(--grn);flex-shrink:0}
-.tua{font-size:11px;font-family:var(--fm);color:var(--red);flex-shrink:0}
-.st{font-size:10px;padding:2px 7px;border-radius:20px;flex-shrink:0}
-.sto{background:rgba(108,99,255,.15);color:var(--acc)}.stp{background:rgba(255,209,102,.15);color:var(--yel)}.stov{background:rgba(255,101,132,.15);color:var(--red)}.sth{background:rgba(255,154,60,.15);color:var(--ora)}
-.dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
-.d1{background:#555}.d2{background:var(--acc)}.d3{background:var(--yel)}.d4{background:var(--red)}
-.res-box{background:var(--s2);border:1px solid var(--bd);border-radius:12px;padding:16px}
-.res-sum{display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap}
-.rok{color:var(--grn);font-weight:600;font-size:13px}.rfail{color:var(--red);font-size:13px}
-.tabs{display:flex;gap:4px}
-.tab{padding:5px 12px;border-radius:8px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid transparent;color:var(--mut);transition:all .15s}
-.tab.active{background:var(--s2);border-color:var(--bd);color:var(--txt)}
-.toast{position:fixed;bottom:20px;right:20px;background:var(--s2);border:1px solid var(--bd);border-radius:12px;padding:12px 18px;font-size:12px;z-index:9999;transform:translateY(80px);opacity:0;transition:all .25s;max-width:300px}
-.toast.show{transform:translateY(0);opacity:1}.toast.ok{border-color:var(--grn);color:var(--grn)}.toast.err{border-color:var(--red);color:var(--red)}
-.spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite}
+.dbadge{font-family:var(--fm);font-size:11px;color:var(--muted);background:var(--surface2);padding:3px 10px;border-radius:20px;border:1px solid var(--border)}
+.last-sync{font-size:11px;color:var(--muted)}
+
+main{max-width:1280px;margin:0 auto;padding:28px 24px}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:28px}
+.sc{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 20px;position:relative;overflow:hidden;transition:border-color .2s,transform .2s;cursor:default}
+.sc:hover{transform:translateY(-2px)}
+.sc::after{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:2px 2px 0 0}
+.sc.purple::after{background:var(--accent)}
+.sc.red::after{background:var(--accent2)}
+.sc.green::after{background:var(--green)}
+.sc.yellow::after{background:var(--yellow)}
+.sc.orange::after{background:var(--orange)}
+.sc.gray::after{background:var(--muted)}
+.sn{font-family:var(--fh);font-size:32px;font-weight:800;line-height:1;margin-bottom:5px}
+.sl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:500}
+
+.sec{background:var(--surface);border:1px solid var(--border);border-radius:18px;margin-bottom:20px;overflow:hidden}
+.sh{padding:18px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.st{font-family:var(--fh);font-size:15px;font-weight:700}
+.sb{padding:20px 22px}
+
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:9px;font-size:13px;font-weight:500;font-family:var(--fb);cursor:pointer;border:none;transition:all .15s;white-space:nowrap}
+.bp{background:var(--accent);color:#fff}.bp:hover{background:#7c74ff;transform:translateY(-1px)}
+.bg{background:var(--green);color:#000;font-weight:600}.bg:hover{opacity:.85;transform:translateY(-1px)}
+.bo{background:transparent;border:1px solid var(--border);color:var(--text)}.bo:hover{border-color:var(--accent);color:var(--accent)}
+.btn:disabled{opacity:.4;cursor:not-allowed;transform:none!important}
+.bgrp{display:flex;gap:8px;flex-wrap:wrap}
+
+.asg{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin-bottom:14px}
+.atog{display:flex;align-items:center;gap:8px;padding:9px 13px;border-radius:9px;border:1px solid var(--border);background:var(--surface2);cursor:pointer;transition:all .15s;user-select:none}
+.atog.on{border-color:var(--accent);background:rgba(108,99,255,.12)}
+.atog input{display:none}
+.ck{width:15px;height:15px;border-radius:4px;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:9px;transition:all .15s}
+.atog.on .ck{background:var(--accent);border-color:var(--accent);color:#fff}
+.tn{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.ag{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px}
+.ac{background:var(--surface2);border:1px solid var(--border);border-radius:13px;padding:14px;display:flex;align-items:center;gap:11px;transition:all .2s}
+.ac:hover{border-color:var(--accent);transform:translateY(-2px)}
+.av{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-family:var(--fh);font-size:13px;font-weight:700;flex-shrink:0}
+.ai{flex:1;min-width:0}
+.an{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
+.astat{font-size:11px;color:var(--muted);font-family:var(--fm)}
+.abar{height:3px;border-radius:2px;background:var(--border);margin-top:7px;overflow:hidden}
+.abf{height:100%;border-radius:2px;transition:width .6s ease}
+.sbtn{padding:5px 9px;font-size:11px;border-radius:7px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;font-family:var(--fb);white-space:nowrap}
+.sbtn:hover{border-color:var(--accent2);color:var(--accent2)}
+
+.tlist{max-height:380px;overflow-y:auto}
+.tlist::-webkit-scrollbar{width:3px}
+.tlist::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.tr{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px}
+.tr:last-child{border-bottom:none}
+.tid{font-family:var(--fm);font-size:11px;color:var(--accent);min-width:58px;flex-shrink:0}
+.tsub{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{display:inline-block;padding:1px 7px;border-radius:20px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;flex-shrink:0}
+.tag-open{background:rgba(108,99,255,.15);color:var(--accent)}
+.tag-pending{background:rgba(255,209,102,.15);color:var(--yellow)}
+.tag-overdue{background:rgba(255,101,132,.2);color:var(--accent2)}
+.tag-unassigned{background:rgba(255,159,67,.15);color:var(--orange)}
+.tag-ok{background:rgba(0,229,160,.15);color:var(--green)}
+.tag-fail{background:rgba(255,101,132,.15);color:var(--accent2)}
+.tagent{font-size:11px;color:var(--green);font-family:var(--fm);white-space:nowrap;flex-shrink:0}
+.pdot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+
+.toast{position:fixed;bottom:24px;right:24px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:12px 18px;font-size:13px;z-index:9999;transform:translateY(100px);opacity:0;transition:all .3s;max-width:300px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.success{border-color:var(--green);color:var(--green)}
+.toast.error{border-color:var(--accent2);color:var(--accent2)}
+.toast.info{border-color:var(--accent);color:var(--accent)}
+
+.spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
-.empty{text-align:center;padding:32px;color:var(--mut);font-size:13px}
-.errbox{background:rgba(255,101,132,.08);border:1px solid rgba(255,101,132,.3);border-radius:10px;padding:14px;font-size:12px;color:var(--red);margin-top:12px}
+.empty{text-align:center;padding:36px;color:var(--muted);font-size:13px}
+.scnt{font-size:12px;color:var(--muted);margin-top:6px}
+.divider{height:1px;background:var(--border);margin:14px 0}
+.rsum{display:flex;gap:16px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+.err-box{background:rgba(255,101,132,.08);border:1px solid rgba(255,101,132,.3);border-radius:10px;padding:14px 18px;color:var(--accent2);font-size:13px;font-family:var(--fm)}
+
+@media(max-width:600px){
+  header{padding:12px 16px}
+  main{padding:16px}
+  .stats{grid-template-columns:1fr 1fr}
+  .sn{font-size:26px}
+}
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">Trust<span>VA</span> &middot; Ticket Desk</div>
-  <div class="hr">
-    <div class="live"></div>
-    <div class="dom" id="dom-badge">loading...</div>
-    <span class="synct" id="synct">not synced</span>
-    <button class="btn btn-gh" id="rfbtn" onclick="loadAll()">&#8635; Refresh</button>
+  <div class="logo">Trust<span>VA</span> · Ticket Desk</div>
+  <div class="hright">
+    <div class="dot"></div>
+    <div class="dbadge" id="dlbl">${DOMAIN || "not set"}</div>
+    <span class="last-sync" id="lsync"></span>
+    <button class="btn bo" id="rbtn" onclick="loadAll()">↻ Refresh</button>
   </div>
 </header>
+
 <main>
-<div class="stats">
-  <div class="sc c1"><div class="sc-n" id="s-open">...</div><div class="sc-l">Open</div></div>
-  <div class="sc c2"><div class="sc-n" id="s-unassigned">...</div><div class="sc-l">Unassigned</div></div>
-  <div class="sc c3"><div class="sc-n" id="s-assigned">...</div><div class="sc-l">Assigned</div></div>
-  <div class="sc c4"><div class="sc-n" id="s-unresolved">...</div><div class="sc-l">Unresolved</div></div>
-  <div class="sc c5"><div class="sc-n" id="s-overdue">...</div><div class="sc-l">Overdue</div></div>
-  <div class="sc c6"><div class="sc-n" id="s-agents">14</div><div class="sc-l">Agents</div></div>
-</div>
-<div class="sec">
-  <div class="sec-h">
-    <div class="sec-t">&#9889; Step 1 &mdash; Assign Unassigned Tickets</div>
-    <div class="brow">
-      <button class="btn btn-gh" onclick="selAll(1)">Select All</button>
-      <button class="btn btn-gh" onclick="selNone(1)">Clear</button>
-      <button class="btn btn-g" id="b1" onclick="doAssign()">Assign Unassigned Equally</button>
+  <!-- STATS -->
+  <div class="stats">
+    <div class="sc purple"><div class="sn" id="s-open">—</div><div class="sl">Open</div></div>
+    <div class="sc red"><div class="sn" id="s-unassigned">—</div><div class="sl">Unassigned</div></div>
+    <div class="sc green"><div class="sn" id="s-assigned">—</div><div class="sl">Assigned</div></div>
+    <div class="sc orange"><div class="sn" id="s-unresolved">—</div><div class="sl">Unresolved</div></div>
+    <div class="sc yellow"><div class="sn" id="s-pending">—</div><div class="sl">Pending</div></div>
+    <div class="sc gray"><div class="sn" id="s-overdue">—</div><div class="sl">Overdue</div></div>
+    <div class="sc purple"><div class="sn">${AGENT_IDS.length}</div><div class="sl">Agents</div></div>
+  </div>
+
+  <!-- ASSIGN ALL -->
+  <div class="sec">
+    <div class="sh">
+      <div class="st">⚡ Assign All Unassigned Now</div>
+      <button class="btn bg" id="aall-btn" onclick="assignAllNow()">→ Assign All Equally</button>
+    </div>
+    <div class="sb">
+      <div id="aall-result" class="empty">Click "Assign All Equally" to distribute all <strong id="ucount-hint">—</strong> unassigned tickets equally across all ${AGENT_IDS.length} agents.</div>
     </div>
   </div>
-  <div class="sec-b">
-    <p class="hint">Picks only unassigned open tickets and distributes equally to selected agents.</p>
-    <div class="ag-grid" id="g1"></div>
-    <div class="selc" id="c1"></div>
-    <div id="r1" style="margin-top:16px"></div>
-  </div>
-</div>
-<div class="sec">
-  <div class="sec-h">
-    <div class="sec-t">&#128256; Step 2 &mdash; Shuffle ALL Open Tickets</div>
-    <div class="brow">
-      <button class="btn btn-gh" onclick="selAll(2)">Select All</button>
-      <button class="btn btn-gh" onclick="selNone(2)">Clear</button>
-      <button class="btn btn-o" id="b2" onclick="doShuffle()">Shuffle All to Selected</button>
-    </div>
-  </div>
-  <div class="sec-b">
-    <p class="hint">Redistributes ALL open tickets (assigned + unassigned) equally to selected agents.</p>
-    <div class="ag-grid" id="g2"></div>
-    <div class="selc" id="c2"></div>
-    <div id="r2" style="margin-top:16px"></div>
-  </div>
-</div>
-<div class="sec">
-  <div class="sec-h">
-    <div class="sec-t">&#128308; Unresolved Tickets</div>
-    <div class="brow">
-      <div class="tabs" id="utabs">
-        <div class="tab active" onclick="flt('all',this)">All</div>
-        <div class="tab" onclick="flt('unassigned',this)">Unassigned</div>
-        <div class="tab" onclick="flt('overdue',this)">Overdue</div>
+
+  <!-- ASSIGN TO SPECIFIC AGENTS -->
+  <div class="sec">
+    <div class="sh">
+      <div>
+        <div class="st">🎯 Assign to Specific Agents</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px">Select agents → choose mode below</div>
       </div>
-      <button class="btn btn-gh" onclick="loadUnres()">&#8635;</button>
+      <div class="bgrp">
+        <button class="btn bo" onclick="selAll()">All</button>
+        <button class="btn bo" onclick="selNone()">None</button>
+        <button class="btn bo" id="asel-u-btn" onclick="assignSelectedUnassigned()">Unassigned Only</button>
+        <button class="btn bp" id="asel-f-btn" onclick="assignSelectedFull()">Unassigned + Unresolved</button>
+      </div>
+    </div>
+    <div class="sb">
+      <div class="asg" id="asel-grid"></div>
+      <div class="scnt" id="scnt"></div>
+      <div id="asel-result"></div>
     </div>
   </div>
-  <div class="sec-b"><div id="unres-list"><div class="empty">Loading...</div></div></div>
-</div>
-<div class="sec">
-  <div class="sec-h">
-    <div class="sec-t">&#128101; Agent Workload</div>
-    <button class="btn btn-gh" onclick="loadAgents()">&#8635; Refresh</button>
+
+  <!-- UNRESOLVED TICKETS -->
+  <div class="sec">
+    <div class="sh">
+      <div>
+        <div class="st">🔴 Unresolved Tickets</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px">All open + pending — not yet resolved</div>
+      </div>
+      <div class="bgrp">
+        <button class="btn bo" onclick="filterUR('all')">All</button>
+        <button class="btn bo" onclick="filterUR('unassigned')">Unassigned</button>
+        <button class="btn bo" onclick="filterUR('overdue')">Overdue</button>
+      </div>
+    </div>
+    <div class="sb">
+      <div class="tlist" id="ur-list"><div class="empty">Loading...</div></div>
+    </div>
   </div>
-  <div class="sec-b"><div class="wl-grid" id="wl-grid"><div class="empty">Loading...</div></div></div>
-</div>
+
+  <!-- AGENT WORKLOAD -->
+  <div class="sec">
+    <div class="sh">
+      <div class="st">👥 Agent Workload</div>
+      <button class="btn bo" onclick="loadAgents()">↻ Refresh</button>
+    </div>
+    <div class="sb">
+      <div class="ag" id="agent-grid"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
 </main>
-<div class="toast" id="toast"></div>`;
 
-const HTML_SCRIPT_TOP = `
+<div class="toast" id="toast"></div>
+
 <script>
+const AGENTS = ${JSON.stringify(AGENT_IDS.map((id, i) => ({ id, name: AGENT_NAMES[i] || "Agent " + (i + 1) })))};
+const COLS = ["#6c63ff","#ff6584","#00e5a0","#ffd166","#ff9f43","#38bdf8","#a78bfa","#34d399","#f472b6","#60a5fa","#facc15","#4ade80","#f87171","#818cf8"];
+let selAgents = new Set(AGENTS.map(a => a.id));
+let urData = [];
 
-var COLS = ["#6c63ff","#ff6584","#00e5a0","#ffd166","#38bdf8","#fb923c","#a78bfa","#34d399","#f472b6","#60a5fa","#facc15","#4ade80","#f87171","#818cf8"];
-var allUnres = [];
-var curFlt = "all";
-var sel1, sel2, AGENTS;
-`;
-
-const HTML_SCRIPT_BOT = `
-sel1 = new Set(AGENTS.map(function(a){return a.id;}));
-sel2 = new Set(AGENTS.map(function(a){return a.id;}));
-
-document.getElementById("dom-badge").textContent = AGENTS.length + " agents";
-document.getElementById("s-agents").textContent  = AGENTS.length;
-
-function mkGrid(n, gid, cid) {
-  var html = "";
-  AGENTS.forEach(function(a) {
-    html += '<label class="ag-tog on" id="t'+n+'x'+a.id+'" onclick="tgl('+n+','+a.id+',this)">'
-      + '<div class="chk">&#10003;</div>'
-      + '<span class="tname">'+a.name+'</span>'
-      + '</label>';
-  });
-  document.getElementById(gid).innerHTML = html;
-  updC(n);
+// ── AGENT SELECT ──────────────────────────────────────────────────────────────
+function initSel() {
+  // selAgents is already populated above — just render checkboxes
+  document.getElementById("asel-grid").innerHTML = AGENTS.map(a =>
+    '<label class="atog on" id="tog-' + a.id + '" onclick="togAgent(' + a.id + ')">' +
+    '<div class="ck">✓</div><span class="tn">' + esc(a.name) + '</span></label>'
+  ).join("");
+  updScnt();
 }
 
-function tgl(n, id, el) {
-  var sel = n===1 ? sel1 : sel2;
-  if (el.classList.contains("on")) {
-    sel.delete(id); el.classList.remove("on"); el.querySelector(".chk").innerHTML = "";
+function togAgent(id) {
+  const el = document.getElementById("tog-" + id);
+  if (selAgents.has(id)) {
+    selAgents.delete(id);
+    el.className = "atog";
+    el.querySelector(".ck").textContent = "";
   } else {
-    sel.add(id); el.classList.add("on"); el.querySelector(".chk").innerHTML = "&#10003;";
+    selAgents.add(id);
+    el.className = "atog on";
+    el.querySelector(".ck").textContent = "✓";
   }
-  updC(n);
+  updScnt();
 }
 
-function selAll(n) {
-  var sel = n===1?sel1:sel2;
-  AGENTS.forEach(function(a) {
-    sel.add(a.id);
-    var el = document.getElementById("t"+n+"x"+a.id);
-    if (el) { el.classList.add("on"); el.querySelector(".chk").innerHTML="&#10003;"; }
-  });
-  updC(n);
-}
+function selAll()  { AGENTS.forEach(a => { selAgents.add(a.id);    const e=document.getElementById("tog-"+a.id); e.className="atog on"; e.querySelector(".ck").textContent="✓"; }); updScnt(); }
+function selNone() { AGENTS.forEach(a => { selAgents.delete(a.id); const e=document.getElementById("tog-"+a.id); e.className="atog";    e.querySelector(".ck").textContent="";  }); updScnt(); }
+function updScnt() { document.getElementById("scnt").textContent = selAgents.size + " agent" + (selAgents.size===1?"":"s") + " selected"; }
 
-function selNone(n) {
-  var sel = n===1?sel1:sel2;
-  AGENTS.forEach(function(a) {
-    sel.delete(a.id);
-    var el = document.getElementById("t"+n+"x"+a.id);
-    if (el) { el.classList.remove("on"); el.querySelector(".chk").innerHTML=""; }
-  });
-  updC(n);
-}
-
-function updC(n) {
-  var sel = n===1?sel1:sel2;
-  var el = document.getElementById("c"+n);
-  if (el) el.textContent = sel.size+" agent"+(sel.size===1?"":"s")+" selected";
-}
-
-async function apiFetch(path, opts) {
-  var res = await fetch(path, opts);
-  var data = await res.json();
-  if (!res.ok) throw new Error(data.error || "HTTP "+res.status);
-  return data;
-}
-
+// ── LOAD DASHBOARD ────────────────────────────────────────────────────────────
 async function loadAll() {
-  var btn = document.getElementById("rfbtn");
+  const btn = document.getElementById("rbtn");
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
-  try { await Promise.all([loadStats(), loadAgents(), loadUnres()]); }
-  catch(e) { console.error("loadAll error:", e); }
-  document.getElementById("synct").textContent =
-    "Synced " + new Date().toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata"});
-  btn.disabled = false; btn.innerHTML = "&#8635; Refresh";
-}
-
-async function loadStats() {
   try {
-    var d = await apiFetch("/api/stats");
+    const r = await fetch("/api/stats");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+
     document.getElementById("s-open").textContent       = d.open;
     document.getElementById("s-unassigned").textContent = d.unassigned;
     document.getElementById("s-assigned").textContent   = d.assigned;
     document.getElementById("s-unresolved").textContent = d.unresolved;
+    document.getElementById("s-pending").textContent    = d.pending;
     document.getElementById("s-overdue").textContent    = d.overdue;
+    document.getElementById("ucount-hint").textContent  = d.unassigned;
+    urData = d.unresolvedTickets || [];
+    renderUR(urData);
+    await loadAgents();
+    document.getElementById("lsync").textContent = "synced " + new Date().toLocaleTimeString("en-IN");
   } catch(e) {
-    ["s-open","s-unassigned","s-assigned","s-unresolved","s-overdue"].forEach(function(id){
-      document.getElementById(id).textContent = "!";
-    });
-    toast("Stats failed: "+e.message, "err");
+    toast("API error: " + e.message + " — check Railway logs", "error");
+    console.error(e);
   }
+  btn.disabled = false; btn.innerHTML = "↻ Refresh";
 }
 
+// ── UNRESOLVED LIST ───────────────────────────────────────────────────────────
+const STATUS_LABEL = {2:"open", 3:"pending"};
+const P_COLOR = {1:"#5a5a72", 2:"#ffd166", 3:"#ff9f43", 4:"#ff6584"};
+
+function renderUR(tickets) {
+  const el = document.getElementById("ur-list");
+  if (!tickets.length) { el.innerHTML = '<div class="empty">🎉 No unresolved tickets!</div>'; return; }
+  el.innerHTML = tickets.map(t => {
+    const overdue = t.due_by && new Date(t.due_by) < new Date() && t.status < 4;
+    const agName  = AGENTS.find(a => a.id === t.responder_id)?.name || "";
+    const stLabel = overdue ? "overdue" : (STATUS_LABEL[t.status] || "open");
+    const stClass = overdue ? "tag-overdue" : "tag-" + stLabel;
+    return '<div class="tr">' +
+      '<span class="tid">#' + t.id + '</span>' +
+      '<div class="pdot" style="background:' + (P_COLOR[t.priority||1]) + '" title="P' + (t.priority||1) + '"></div>' +
+      '<span class="tsub">' + esc(t.subject) + '</span>' +
+      '<span class="tag ' + stClass + '">' + stLabel + '</span>' +
+      (!t.responder_id ? '<span class="tag tag-unassigned">unassigned</span>' : '') +
+      (agName ? '<span class="tagent">' + esc(agName) + '</span>' : '') +
+    '</div>';
+  }).join("");
+}
+
+function filterUR(mode) {
+  if (mode === "all")        renderUR(urData);
+  if (mode === "unassigned") renderUR(urData.filter(t => !t.responder_id));
+  if (mode === "overdue")    renderUR(urData.filter(t => t.due_by && new Date(t.due_by) < new Date() && t.status < 4));
+}
+
+// ── AGENT WORKLOAD ────────────────────────────────────────────────────────────
 async function loadAgents() {
-  var g = document.getElementById("wl-grid");
+  const grid = document.getElementById("agent-grid");
   try {
-    var agents = await apiFetch("/api/agents");
-    var mo = 1;
-    agents.forEach(function(a){ if(a.open>mo) mo=a.open; });
-    var html = "";
-    agents.forEach(function(a, i) {
-      var ini = a.name.split(" ").map(function(w){return w[0]||"";}).join("").toUpperCase().slice(0,2);
-      var c = COLS[i%COLS.length];
-      var pct = Math.round(a.open/mo*100);
-      html += '<div class="wl-card">'
-        + '<div class="av" style="background:'+c+'22;color:'+c+'">'+ini+'</div>'
-        + '<div class="wl-i">'
-        +   '<div class="wl-n">'+a.name+'</div>'
-        +   '<div class="wl-c"><span class="oc">'+a.open+' open</span><span class="uc">'+a.unresolved+' unresolved</span></div>'
-        +   '<div class="wl-bar"><div class="wl-bf" style="width:'+pct+'%;background:'+c+'"></div></div>'
-        + '</div>'
-        + '<button class="sf-btn" onclick="doReshuffle('+a.id+')">Shuffle</button>'
-        + '</div>';
-    });
-    g.innerHTML = html;
+    const r = await fetch("/api/agents");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (!d.length) { grid.innerHTML = '<div class="empty">No agent data</div>'; return; }
+    const maxOpen = Math.max(...d.map(a => a.count), 1);
+    grid.innerHTML = d.map((a, i) =>
+      '<div class="ac">' +
+        '<div class="av" style="background:' + COLS[i%COLS.length] + '22;color:' + COLS[i%COLS.length] + '">' + initials(a.name) + '</div>' +
+        '<div class="ai">' +
+          '<div class="an">' + esc(a.name) + '</div>' +
+          '<div class="astat">' + a.count + ' open · ' + a.unresolved + ' unresolved</div>' +
+          '<div class="abar"><div class="abf" style="width:' + Math.round(a.count/maxOpen*100) + '%;background:' + COLS[i%COLS.length] + '"></div></div>' +
+        '</div>' +
+        '<button class="sbtn" onclick="doReshuffle(' + a.id + ',\'' + esc(a.name) + '\')">Shuffle</button>' +
+      '</div>'
+    ).join("");
   } catch(e) {
-    g.innerHTML = '<div class="errbox">Failed: '+e.message+'</div>';
+    grid.innerHTML = '<div class="err-box">Failed to load agents: ' + e.message + '</div>';
   }
 }
 
-async function loadUnres() {
+// ── ASSIGN ACTIONS ────────────────────────────────────────────────────────────
+async function assignAllNow() {
+  const btn = document.getElementById("aall-btn");
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Assigning...';
   try {
-    allUnres = await apiFetch("/api/unresolved");
-    renderUnres();
-  } catch(e) {
-    document.getElementById("unres-list").innerHTML = '<div class="errbox">Failed: '+e.message+'</div>';
-  }
-}
-
-function flt(f, el) {
-  curFlt = f;
-  document.querySelectorAll("#utabs .tab").forEach(function(t){t.classList.remove("active");});
-  el.classList.add("active");
-  renderUnres();
-}
-
-function renderUnres() {
-  var now = new Date();
-  var list = allUnres.slice();
-  if (curFlt==="unassigned") list = list.filter(function(t){return !t.agent;});
-  if (curFlt==="overdue")    list = list.filter(function(t){return t.due_by && new Date(t.due_by)<now;});
-  if (list.length===0) { document.getElementById("unres-list").innerHTML='<div class="empty">No tickets &#10003;</div>'; return; }
-  var slbl = {2:"open",3:"pending",6:"on hold"};
-  var scls = {2:"sto",3:"stp",6:"sth"};
-  var pcls = {1:"d1",2:"d2",3:"d3",4:"d4"};
-  var rows = "";
-  list.slice(0,100).forEach(function(t) {
-    var ov    = t.due_by && new Date(t.due_by)<now;
-    var stC   = ov?"stov":(scls[t.status]||"sto");
-    var stL   = ov?"overdue":(slbl[t.status]||"open");
-    var agH   = t.agent ? '<span class="tok">'+t.agent+'</span>' : '<span class="tua">unassigned</span>';
-    rows += '<div class="tkt-row">'
-      + '<div class="dot '+(pcls[t.priority]||"d1")+'"></div>'
-      + '<span class="tid">#'+t.id+'</span>'
-      + '<span class="tsub">'+t.subject+'</span>'
-      + '<span class="st '+stC+'">'+stL+'</span>'
-      + agH+'</div>';
-  });
-  var more = list.length>100 ? '<div style="padding:8px 0;color:var(--mut);font-size:11px">...and '+(list.length-100)+' more</div>' : "";
-  document.getElementById("unres-list").innerHTML =
-    '<div style="font-size:11px;color:var(--mut);margin-bottom:10px">'+Math.min(list.length,100)+' of '+list.length+' tickets</div>'
-    +'<div class="tkt-list">'+rows+'</div>'+more;
-}
-
-async function doAssign() {
-  if (sel1.size===0) { toast("Select at least 1 agent!","err"); return; }
-  var btn = document.getElementById("b1");
-  btn.disabled=true; btn.innerHTML='<span class="spin"></span> Assigning...';
-  try {
-    var d = await apiFetch("/api/assign-unassigned",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentIds:[...sel1]})});
-    showRes("r1", d); await loadAll();
-  } catch(e) { document.getElementById("r1").innerHTML='<div class="errbox">Failed: '+e.message+'</div>'; toast("Failed","err"); }
-  btn.disabled=false; btn.innerHTML="Assign Unassigned Equally";
-}
-
-async function doShuffle() {
-  if (sel2.size===0) { toast("Select at least 1 agent!","err"); return; }
-  var total = document.getElementById("s-open").textContent;
-  if (!confirm("Reassign ALL "+total+" open tickets to "+sel2.size+" agents?")) return;
-  var btn = document.getElementById("b2");
-  btn.disabled=true; btn.innerHTML='<span class="spin"></span> Shuffling...';
-  try {
-    var d = await apiFetch("/api/shuffle-all",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentIds:[...sel2]})});
-    showRes("r2", d); await loadAll();
-  } catch(e) { document.getElementById("r2").innerHTML='<div class="errbox">Failed: '+e.message+'</div>'; toast("Failed","err"); }
-  btn.disabled=false; btn.innerHTML="Shuffle All to Selected";
-}
-
-async function doReshuffle(agentId) {
-  var agent = AGENTS.find(function(a){return a.id===agentId;});
-  var name  = agent ? agent.name : "Agent";
-  if (!confirm("Move all of "+name+"'s tickets to other agents?")) return;
-  toast("Reshuffling "+name+"...");
-  try {
-    var d = await apiFetch("/api/reshuffle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agentId:agentId})});
-    toast("Moved "+d.reassigned+" tickets from "+name,"ok");
+    const r = await fetch("/api/assign-unassigned", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds: AGENTS.map(a=>a.id) }) });
+    const d = await r.json();
+    showResult(d, "aall-result");
     await loadAll();
-  } catch(e) { toast("Failed: "+e.message,"err"); }
+  } catch(e) { toast("Assignment failed: " + e.message, "error"); }
+  btn.disabled = false; btn.innerHTML = "→ Assign All Equally";
 }
 
-function showRes(elId, data) {
-  if (data.assigned===0) { document.getElementById(elId).innerHTML='<div class="empty">&#10003; Nothing to assign!</div>'; toast("Nothing to assign","ok"); return; }
-  var rows = "";
-  (data.tickets||[]).slice(0,60).forEach(function(t){
-    rows += '<div class="tkt-row"><span class="tid">#'+t.id+'</span><span class="tsub">'+t.subject+'</span>'
-      +(t.ok?'<span class="tok">'+t.agent+'</span>':'<span class="tua">failed</span>')+'</div>';
-  });
-  var more = data.tickets.length>60 ? '<div style="padding:8px 0;color:var(--mut);font-size:11px">...and '+(data.tickets.length-60)+' more</div>' : "";
-  document.getElementById(elId).innerHTML =
-    '<div class="res-box"><div class="res-sum"><span class="rok">&#10003; '+data.assigned+' assigned</span>'
-    +(data.failed>0?'<span class="rfail">&#10007; '+data.failed+' failed</span>':'')
-    +'</div><div class="tkt-list">'+rows+'</div>'+more+'</div>';
-  toast(data.assigned+" tickets assigned!","ok");
+async function assignSelectedUnassigned() {
+  if (!selAgents.size) { toast("Select at least one agent!", "error"); return; }
+  const btn = document.getElementById("asel-u-btn");
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+  try {
+    const r = await fetch("/api/assign-unassigned", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds:[...selAgents] }) });
+    const d = await r.json();
+    showResult(d, "asel-result");
+    await loadAll();
+  } catch(e) { toast("Failed: " + e.message, "error"); }
+  btn.disabled = false; btn.innerHTML = "Unassigned Only";
 }
 
+async function assignSelectedFull() {
+  if (!selAgents.size) { toast("Select at least one agent!", "error"); return; }
+  const btn = document.getElementById("asel-f-btn");
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Working...';
+  try {
+    const r = await fetch("/api/assign-full", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds:[...selAgents] }) });
+    const d = await r.json();
+    showResult(d, "asel-result");
+    await loadAll();
+  } catch(e) { toast("Failed: " + e.message, "error"); }
+  btn.disabled = false; btn.innerHTML = "Unassigned + Unresolved";
+}
+
+async function doReshuffle(id, name) {
+  if (!confirm("Move ALL of " + name + "'s tickets to other agents?")) return;
+  toast("Reshuffling " + name + "...", "info");
+  try {
+    const r = await fetch("/api/reshuffle", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentId: id }) });
+    const d = await r.json();
+    toast("Moved " + d.reassigned + " tickets from " + name, "success");
+    await loadAll();
+  } catch(e) { toast("Reshuffle failed", "error"); }
+}
+
+// ── RESULT RENDERER ───────────────────────────────────────────────────────────
+function showResult(data, elId) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (data.error) { el.innerHTML = '<div class="err-box">Error: ' + esc(data.error) + '</div>'; return; }
+  if (!data.assigned) { el.innerHTML = '<div class="empty" style="padding:16px">✅ No unassigned tickets — all clear!</div>'; toast("Nothing to assign!", "success"); return; }
+  const rows = (data.tickets||[]).slice(0,60).map(t =>
+    '<div class="tr">' +
+    '<span class="tid">#' + t.id + '</span>' +
+    '<span class="tag ' + (t.type==="unassigned"?"tag-unassigned":"tag-pending") + '">' + (t.type||"") + '</span>' +
+    '<span class="tsub">' + esc(t.subject) + '</span>' +
+    (t.ok ? '<span class="tagent">→ ' + esc(t.agent||"") + '</span>' : '<span class="tag tag-fail">failed</span>') +
+    '</div>'
+  ).join("");
+  el.innerHTML =
+    '<div class="divider"></div>' +
+    '<div class="rsum"><span style="color:var(--green);font-weight:600">✅ ' + data.assigned + ' assigned</span>' +
+    (data.failed > 0 ? '<span style="color:var(--accent2)">❌ ' + data.failed + ' failed</span>' : '') + '</div>' +
+    '<div class="tlist">' + rows + (data.tickets.length>60 ? '<div style="padding:8px;color:var(--muted);font-size:12px">...and '+(data.tickets.length-60)+' more</div>' : '') + '</div>';
+  toast(data.assigned + " tickets assigned!", "success");
+}
+
+function initials(n){ return (n||"?").split(" ").map(w=>w[0]||"").join("").toUpperCase().slice(0,2)||"??"; }
+function esc(s){ return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 function toast(msg, type) {
-  var t = document.getElementById("toast");
-  t.textContent = msg;
-  t.className = "toast show"+(type?" "+type:"");
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.className = "toast show" + (type?" "+type:"");
   clearTimeout(window._tt);
-  window._tt = setTimeout(function(){t.className="toast";}, 3500);
+  window._tt = setTimeout(()=>t.className="toast", 3500);
 }
 
-mkGrid(1,"g1","c1");
-mkGrid(2,"g2","c2");
+initSel();
 loadAll();
 setInterval(loadAll, 90000);
-
 </script>
-</body></html>`;
+</body>
+</html>`;
 
-function buildHTML(agentsJson) {
-  // Inject agents as a JS assignment — completely safe, no template literal issues
-  var agentScript = '\nAGENTS = ' + agentsJson + ';\n';
-  return HTML_TOP + HTML_SCRIPT_TOP + agentScript + HTML_SCRIPT_BOT;
-}
-
-// ── HTTP SERVER ───────────────────────────────────────────────────────────────
-const server = http.createServer(async function(req, res) {
+// ─── HTTP SERVER ──────────────────────────────────────────────────────────────
+const server = http.createServer(async (req, res) => {
   const p = url.parse(req.url).pathname;
-  console.log(req.method + " " + p);
-
-  function sendJSON(code, data) {
-    res.writeHead(code, {"Content-Type":"application/json","Access-Control-Allow-Origin":"*"});
-    res.end(JSON.stringify(data));
-  }
+  res.setHeader("Content-Type", "application/json");
 
   if (p === "/" || p === "/dashboard") {
-    const agentsJson = JSON.stringify(AGENT_IDS.map(function(id, i) {
-      return { id: id, name: AGENT_NAMES[i] || "Agent " + (i+1) };
-    }));
-    res.writeHead(200, {"Content-Type":"text/html; charset=utf-8"});
-    res.end(buildHTML(agentsJson));
+    res.setHeader("Content-Type", "text/html");
+    res.writeHead(200);
+    res.end(HTML);
     return;
   }
 
   if (p === "/api/stats") {
-    try { sendJSON(200, await getStats()); }
-    catch(e) { console.error("/api/stats:", e.message); sendJSON(500, {error:e.message}); }
+    try {
+      res.writeHead(200);
+      res.end(JSON.stringify(await getStats()));
+    } catch(e) {
+      console.error("/api/stats error:", e.message);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 
   if (p === "/api/agents") {
-    try { sendJSON(200, await getAgentWorkload()); }
-    catch(e) { console.error("/api/agents:", e.message); sendJSON(500, {error:e.message}); }
+    try {
+      res.writeHead(200);
+      res.end(JSON.stringify(await getAgentCounts()));
+    } catch(e) {
+      console.error("/api/agents error:", e.message);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 
-  if (p === "/api/unresolved") {
-    try { sendJSON(200, await getUnresolvedTickets()); }
-    catch(e) { console.error("/api/unresolved:", e.message); sendJSON(500, {error:e.message}); }
-    return;
-  }
-
-  if (req.method === "POST") {
-    var body = await new Promise(function(resolve, reject) {
-      var b = "";
-      req.on("data", function(c){b+=c;});
-      req.on("end", function(){
-        try { resolve(JSON.parse(b)); }
-        catch(e) { reject(new Error("Invalid JSON body")); }
-      });
+  if (p === "/api/assign-unassigned" && req.method === "POST") {
+    let b = ""; req.on("data", c => b += c);
+    req.on("end", async () => {
+      try {
+        const { agentIds } = JSON.parse(b);
+        res.writeHead(200);
+        res.end(JSON.stringify(await runUnassignedOnly(agentIds)));
+      } catch(e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: e.message }));
+      }
     });
-
-    if (p === "/api/assign-unassigned") {
-      try { sendJSON(200, await doAssignUnassigned(body.agentIds)); }
-      catch(e) { console.error("/api/assign-unassigned:", e.message); sendJSON(500, {error:e.message}); }
-      return;
-    }
-    if (p === "/api/shuffle-all") {
-      try { sendJSON(200, await doShuffleAll(body.agentIds)); }
-      catch(e) { console.error("/api/shuffle-all:", e.message); sendJSON(500, {error:e.message}); }
-      return;
-    }
-    if (p === "/api/reshuffle") {
-      try { sendJSON(200, await doReshuffleAgent(body.agentId)); }
-      catch(e) { console.error("/api/reshuffle:", e.message); sendJSON(500, {error:e.message}); }
-      return;
-    }
+    return;
   }
 
-  sendJSON(404, {error:"not found"});
+  if (p === "/api/assign-full" && req.method === "POST") {
+    let b = ""; req.on("data", c => b += c);
+    req.on("end", async () => {
+      try {
+        const { agentIds } = JSON.parse(b);
+        res.writeHead(200);
+        res.end(JSON.stringify(await runFullAssignment(agentIds)));
+      } catch(e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if (p === "/api/reshuffle" && req.method === "POST") {
+    let b = ""; req.on("data", c => b += c);
+    req.on("end", async () => {
+      try {
+        const { agentId } = JSON.parse(b);
+        res.writeHead(200);
+        res.end(JSON.stringify(await reshuffleAgent(agentId)));
+      } catch(e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: "not found" }));
 });
 
-server.listen(PORT, function() {
-  console.log("========================================");
-  console.log("TrustVA Ticket Desk running on port " + PORT);
-  console.log("========================================");
-});
+server.listen(PORT, () => console.log("🌐 Dashboard live on port " + PORT));
 
-server.on("error", function(e) { console.error("Server error:", e.message); });
-
-// ── CRON ─────────────────────────────────────────────────────────────────────
-cron.schedule("0 4 * * 1-6", function() {
-  doAssignUnassigned(AGENT_IDS).then(function(r){ console.log("9:30am cron: "+r.assigned+" assigned"); })
-  .catch(function(e){ console.error("cron error:", e.message); });
-}, { timezone: "Asia/Kolkata" });
-
-cron.schedule("*/30 3-14 * * 1-6", async function() {
+// ─── CRON ─────────────────────────────────────────────────────────────────────
+cron.schedule("0 4 * * 1-6", () => runUnassignedOnly(AGENT_IDS), { timezone: "Asia/Kolkata" });
+cron.schedule("*/30 3-14 * * 1-6", async () => {
   try {
-    var all = await getAllTickets("new_and_my_open");
-    var u = all.filter(function(t){return t.status===2&&!t.responder_id;});
-    if (u.length>=20) { console.log("Surge "+u.length+" — auto assigning"); await doAssignUnassigned(AGENT_IDS); }
-    else console.log("Surge check ok: "+u.length+" unassigned");
-  } catch(e) { console.error("surge check error:", e.message); }
+    const all = await fetchAllPages("new_and_my_open");
+    const u = all.filter(t => t.status === 2 && !t.responder_id);
+    if (u.length >= 20) { console.log("🚨 Surge: " + u.length + " unassigned — auto-assigning"); await runUnassignedOnly(AGENT_IDS); }
+  } catch(e) { console.error("Cron error:", e.message); }
 }, { timezone: "Asia/Kolkata" });
+
+console.log("🚀 TrustVA Ticket Desk running!");
+console.log("👥 " + AGENT_IDS.length + " agents: " + AGENT_NAMES.join(", "));
