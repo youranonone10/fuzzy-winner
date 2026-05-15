@@ -21,10 +21,25 @@ console.log("✅ Config loaded:", { DOMAIN, AGENT_IDS, AGENT_NAMES });
 async function fetchAllPages(filter) {
   let page = 1, all = [];
   while (true) {
-    const res = await axios.get(
-      `https://${DOMAIN}/api/v2/tickets?filter=${filter}&per_page=100&page=${page}`,
-      { auth }
-    );
+    const endpoint = filter
+      ? `https://${DOMAIN}/api/v2/tickets?filter=${filter}&per_page=100&page=${page}`
+      : `https://${DOMAIN}/api/v2/tickets?per_page=100&page=${page}`;
+    let res;
+    try {
+      res = await axios.get(endpoint, { auth });
+    } catch (err) {
+      console.error("Freshdesk API fetch failed:", {
+        endpoint,
+        page,
+        status: err.response?.status,
+        data: err.response?.data || err.message
+      });
+      throw new Error(err.response?.data?.description || err.response?.data?.message || err.message);
+    }
+    if (!Array.isArray(res.data)) {
+      console.error("Unexpected Freshdesk response format:", { endpoint, page, data: res.data });
+      throw new Error("Unexpected Freshdesk API response format");
+    }
     all = all.concat(res.data);
     if (res.data.length < 100) break;
     page++;
@@ -34,7 +49,7 @@ async function fetchAllPages(filter) {
 }
 
 async function getStats() {
-  const all = await fetchAllPages("new_and_my_open");
+  const all = await fetchAllPages();
 
   const open       = all.filter(t => t.status === 2);
   const pending    = all.filter(t => t.status === 3);
@@ -50,7 +65,7 @@ async function getStats() {
     pending: pending.length,
     overdue: overdue.length,
     unresolved: unresolved.length,
-    unresolvedTickets: unresolved.slice(0, 200).map(t => ({
+    unresolvedTickets: unresolved.map(t => ({
       id: t.id,
       subject: t.subject || "No subject",
       status: t.status,
@@ -66,13 +81,14 @@ async function getStats() {
 }
 
 async function getAgentCounts() {
-  const all = await fetchAllPages("new_and_my_open");
+  const all = await fetchAllPages();
   const open = all.filter(t => t.status === 2);
+  const unresolved = all.filter(t => t.status < 4);
   return AGENT_IDS.map((id, i) => ({
     id,
     name: AGENT_NAMES[i] || "Agent " + (i + 1),
     count: open.filter(t => t.responder_id === id).length,
-    unresolved: all.filter(t => t.responder_id === id && t.status < 4).length
+    unresolved: unresolved.filter(t => t.responder_id === id).length
   }));
 }
 
@@ -91,8 +107,9 @@ async function assignTicket(ticketId, agentId) {
 }
 
 async function runUnassignedOnly(agentIdList) {
-  agentIdList = agentIdList || AGENT_IDS;
-  const all = await fetchAllPages("new_and_my_open");
+  agentIdList = (agentIdList || AGENT_IDS).map(id => parseInt(id)).filter(id => AGENT_IDS.includes(id));
+  if (!agentIdList.length) return { assigned: 0, failed: 0, tickets: [], perAgent: {}, error: "No valid agents selected" };
+  const all = await fetchAllPages();
   const unassigned = all.filter(t => t.status === 2 && !t.responder_id);
   if (!unassigned.length) return { assigned: 0, failed: 0, tickets: [], perAgent: {} };
 
@@ -116,8 +133,9 @@ async function runUnassignedOnly(agentIdList) {
 }
 
 async function runFullAssignment(agentIdList) {
-  agentIdList = agentIdList || AGENT_IDS;
-  const all = await fetchAllPages("new_and_my_open");
+  agentIdList = (agentIdList || AGENT_IDS).map(id => parseInt(id)).filter(id => AGENT_IDS.includes(id));
+  if (!agentIdList.length) return { assigned: 0, failed: 0, tickets: [], perAgent: {}, error: "No valid agents selected" };
+  const all = await fetchAllPages();
 
   const unassigned = all.filter(t => t.status === 2 && !t.responder_id);
   const unresolved = all.filter(t => t.status < 4 && !!t.responder_id);
@@ -133,19 +151,30 @@ async function runFullAssignment(agentIdList) {
   });
   const results = [];
 
-  for (let i = 0; i < toAssign.length; i++) {
-    const ticket  = toAssign[i];
+  for (let i = 0; i < unassigned.length; i++) {
+    const ticket  = unassigned[i];
     const agentId = agentIdList[i % agentIdList.length];
     const ok = await assignTicket(ticket.id, agentId);
     if (ok) { perAgent[agentId].count++; assigned++; }
     else failed++;
-    results.push({ id: ticket.id, subject: ticket.subject || "No subject", agent: perAgent[agentId]?.name, type: !ticket.responder_id ? "unassigned" : "unresolved", ok });
+    results.push({ id: ticket.id, subject: ticket.subject || "No subject", agent: perAgent[agentId]?.name, type: "unassigned", ok });
+  }
+
+  for (let i = 0; i < unresolved.length; i++) {
+    const ticket  = unresolved[i];
+    const agentId = agentIdList[i % agentIdList.length];
+    const ok = await assignTicket(ticket.id, agentId);
+    if (ok) { perAgent[agentId].count++; assigned++; }
+    else failed++;
+    results.push({ id: ticket.id, subject: ticket.subject || "No subject", agent: perAgent[agentId]?.name, type: "unresolved", ok });
   }
   return { assigned, failed, perAgent, tickets: results };
 }
 
 async function reshuffleAgent(agentId) {
-  const all = await fetchAllPages("new_and_my_open");
+  agentId = parseInt(agentId);
+  if (!AGENT_IDS.includes(agentId)) return { reassigned: 0, total: 0, error: "Invalid agentId" };
+  const all = await fetchAllPages();
   const tickets = all.filter(t => t.responder_id === agentId && t.status < 4);
   const otherAgents = AGENT_IDS.filter(id => id !== agentId);
   if (!otherAgents.length) return { reassigned: 0, total: tickets.length };
@@ -245,6 +274,7 @@ main{max-width:1280px;margin:0 auto;padding:28px 24px}
 .tag-pending{background:rgba(255,209,102,.15);color:var(--yellow)}
 .tag-overdue{background:rgba(255,101,132,.2);color:var(--accent2)}
 .tag-unassigned{background:rgba(255,159,67,.15);color:var(--orange)}
+.tag-priority{background:rgba(56,189,248,.15);color:#38bdf8}
 .tag-ok{background:rgba(0,229,160,.15);color:var(--green)}
 .tag-fail{background:rgba(255,101,132,.15);color:var(--accent2)}
 .tagent{font-size:11px;color:var(--green);font-family:var(--fm);white-space:nowrap;flex-shrink:0}
@@ -294,6 +324,7 @@ main{max-width:1280px;margin:0 auto;padding:28px 24px}
     <div class="sc gray"><div class="sn" id="s-overdue">—</div><div class="sl">Overdue</div></div>
     <div class="sc purple"><div class="sn">${AGENT_IDS.length}</div><div class="sl">Agents</div></div>
   </div>
+  <div id="stats-error"></div>
 
   <!-- ASSIGN ALL -->
   <div class="sec">
@@ -365,6 +396,15 @@ const COLS = ["#6c63ff","#ff6584","#00e5a0","#ffd166","#ff9f43","#38bdf8","#a78b
 let selAgents = new Set(AGENTS.map(a => a.id));
 let urData = [];
 
+async function apiJSON(path, options) {
+  const r = await fetch(path, options);
+  let d = {};
+  try { d = await r.json(); } catch(_) {}
+  if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+  if (d && d.error) throw new Error(d.error);
+  return d;
+}
+
 // ── AGENT SELECT ──────────────────────────────────────────────────────────────
 function initSel() {
   // selAgents is already populated above — just render checkboxes
@@ -398,10 +438,7 @@ async function loadAll() {
   const btn = document.getElementById("rbtn");
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
   try {
-    const r = await fetch("/api/stats");
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
+    const d = await apiJSON("/api/stats");
 
     document.getElementById("s-open").textContent       = d.open;
     document.getElementById("s-unassigned").textContent = d.unassigned;
@@ -413,9 +450,11 @@ async function loadAll() {
     urData = d.unresolvedTickets || [];
     renderUR(urData);
     await loadAgents();
+    document.getElementById("stats-error").innerHTML = "";
     document.getElementById("lsync").textContent = "synced " + new Date().toLocaleTimeString("en-IN");
   } catch(e) {
-    toast("API error: " + e.message + " — check Railway logs", "error");
+    document.getElementById("stats-error").innerHTML = '<div class="err-box">Failed to load stats: ' + esc(e.message) + '</div>';
+    toast("API error: " + e.message, "error");
     console.error(e);
   }
   btn.disabled = false; btn.innerHTML = "↻ Refresh";
@@ -436,6 +475,7 @@ function renderUR(tickets) {
     return '<div class="tr">' +
       '<span class="tid">#' + t.id + '</span>' +
       '<div class="pdot" style="background:' + (P_COLOR[t.priority||1]) + '" title="P' + (t.priority||1) + '"></div>' +
+      '<span class="tag tag-priority">P' + (t.priority || 1) + '</span>' +
       '<span class="tsub">' + esc(t.subject) + '</span>' +
       '<span class="tag ' + stClass + '">' + stLabel + '</span>' +
       (!t.responder_id ? '<span class="tag tag-unassigned">unassigned</span>' : '') +
@@ -454,9 +494,7 @@ function filterUR(mode) {
 async function loadAgents() {
   const grid = document.getElementById("agent-grid");
   try {
-    const r = await fetch("/api/agents");
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const d = await r.json();
+    const d = await apiJSON("/api/agents");
     if (!d.length) { grid.innerHTML = '<div class="empty">No agent data</div>'; return; }
     const maxOpen = Math.max(...d.map(a => a.count), 1);
     grid.innerHTML = d.map((a, i) =>
@@ -480,8 +518,7 @@ async function assignAllNow() {
   const btn = document.getElementById("aall-btn");
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Assigning...';
   try {
-    const r = await fetch("/api/assign-unassigned", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds: AGENTS.map(a=>a.id) }) });
-    const d = await r.json();
+    const d = await apiJSON("/api/assign-unassigned", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds: AGENTS.map(a=>a.id) }) });
     showResult(d, "aall-result");
     await loadAll();
   } catch(e) { toast("Assignment failed: " + e.message, "error"); }
@@ -493,8 +530,7 @@ async function assignSelectedUnassigned() {
   const btn = document.getElementById("asel-u-btn");
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
   try {
-    const r = await fetch("/api/assign-unassigned", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds:[...selAgents] }) });
-    const d = await r.json();
+    const d = await apiJSON("/api/assign-unassigned", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds:[...selAgents] }) });
     showResult(d, "asel-result");
     await loadAll();
   } catch(e) { toast("Failed: " + e.message, "error"); }
@@ -506,8 +542,7 @@ async function assignSelectedFull() {
   const btn = document.getElementById("asel-f-btn");
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Working...';
   try {
-    const r = await fetch("/api/assign-full", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds:[...selAgents] }) });
-    const d = await r.json();
+    const d = await apiJSON("/api/assign-full", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentIds:[...selAgents] }) });
     showResult(d, "asel-result");
     await loadAll();
   } catch(e) { toast("Failed: " + e.message, "error"); }
@@ -518,8 +553,7 @@ async function doReshuffle(id, name) {
   if (!confirm("Move ALL of " + name + "'s tickets to other agents?")) return;
   toast("Reshuffling " + name + "...", "info");
   try {
-    const r = await fetch("/api/reshuffle", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentId: id }) });
-    const d = await r.json();
+    const d = await apiJSON("/api/reshuffle", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ agentId: id }) });
     toast("Moved " + d.reassigned + " tickets from " + name, "success");
     await loadAll();
   } catch(e) { toast("Reshuffle failed", "error"); }
@@ -577,10 +611,11 @@ const server = http.createServer(async (req, res) => {
 
   if (p === "/api/stats") {
     try {
+      const data = await getStats();
       res.writeHead(200);
-      res.end(JSON.stringify(await getStats()));
+      res.end(JSON.stringify(data));
     } catch(e) {
-      console.error("/api/stats error:", e.message);
+      console.error("/api/stats error:", e.response?.data || e.message);
       res.writeHead(500);
       res.end(JSON.stringify({ error: e.message }));
     }
@@ -589,10 +624,11 @@ const server = http.createServer(async (req, res) => {
 
   if (p === "/api/agents") {
     try {
+      const data = await getAgentCounts();
       res.writeHead(200);
-      res.end(JSON.stringify(await getAgentCounts()));
+      res.end(JSON.stringify(data));
     } catch(e) {
-      console.error("/api/agents error:", e.message);
+      console.error("/api/agents error:", e.response?.data || e.message);
       res.writeHead(500);
       res.end(JSON.stringify({ error: e.message }));
     }
@@ -604,9 +640,16 @@ const server = http.createServer(async (req, res) => {
     req.on("end", async () => {
       try {
         const { agentIds } = JSON.parse(b);
+        const result = await runUnassignedOnly(agentIds);
+        if (result.error) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: result.error }));
+          return;
+        }
         res.writeHead(200);
-        res.end(JSON.stringify(await runUnassignedOnly(agentIds)));
+        res.end(JSON.stringify(result));
       } catch(e) {
+        console.error("/api/assign-unassigned error:", e.response?.data || e.message);
         res.writeHead(500);
         res.end(JSON.stringify({ error: e.message }));
       }
@@ -619,9 +662,16 @@ const server = http.createServer(async (req, res) => {
     req.on("end", async () => {
       try {
         const { agentIds } = JSON.parse(b);
+        const result = await runFullAssignment(agentIds);
+        if (result.error) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: result.error }));
+          return;
+        }
         res.writeHead(200);
-        res.end(JSON.stringify(await runFullAssignment(agentIds)));
+        res.end(JSON.stringify(result));
       } catch(e) {
+        console.error("/api/assign-full error:", e.response?.data || e.message);
         res.writeHead(500);
         res.end(JSON.stringify({ error: e.message }));
       }
@@ -634,9 +684,16 @@ const server = http.createServer(async (req, res) => {
     req.on("end", async () => {
       try {
         const { agentId } = JSON.parse(b);
+        const result = await reshuffleAgent(agentId);
+        if (result.error) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: result.error }));
+          return;
+        }
         res.writeHead(200);
-        res.end(JSON.stringify(await reshuffleAgent(agentId)));
+        res.end(JSON.stringify(result));
       } catch(e) {
+        console.error("/api/reshuffle error:", e.response?.data || e.message);
         res.writeHead(500);
         res.end(JSON.stringify({ error: e.message }));
       }
@@ -654,7 +711,7 @@ server.listen(PORT, () => console.log("🌐 Dashboard live on port " + PORT));
 cron.schedule("0 4 * * 1-6", () => runUnassignedOnly(AGENT_IDS), { timezone: "Asia/Kolkata" });
 cron.schedule("*/30 3-14 * * 1-6", async () => {
   try {
-    const all = await fetchAllPages("new_and_my_open");
+    const all = await fetchAllPages();
     const u = all.filter(t => t.status === 2 && !t.responder_id);
     if (u.length >= 20) { console.log("🚨 Surge: " + u.length + " unassigned — auto-assigning"); await runUnassignedOnly(AGENT_IDS); }
   } catch(e) { console.error("Cron error:", e.message); }
